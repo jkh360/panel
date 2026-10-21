@@ -1,0 +1,686 @@
+use std::{
+    collections::{BTreeMap, HashMap},
+    env, fs,
+    io::{self, IsTerminal},
+    path::{Path, PathBuf},
+    sync::mpsc::{self, Receiver},
+    thread,
+    time::Duration,
+};
+
+use anyhow::{Context, Result};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use image::DynamicImage;
+use ratatui::{
+    DefaultTerminal, Frame,
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+};
+use ratatui_image::{
+    Resize, StatefulImage,
+    picker::{Picker, ProtocolType},
+    protocol::StatefulProtocol,
+};
+
+use crate::{document::CbzDocument, progress::ProgressStore};
+
+const BG: Color = Color::Rgb(40, 40, 40);
+const FG: Color = Color::Rgb(235, 219, 178);
+const MUTED: Color = Color::Rgb(168, 153, 132);
+const ACCENT: Color = Color::Rgb(184, 187, 38);
+const YELLOW: Color = Color::Rgb(250, 189, 47);
+
+pub struct Selection {
+    pub path: PathBuf,
+    pub page: Option<usize>,
+}
+
+#[derive(Clone)]
+enum Entry {
+    Directory(PathBuf),
+    Series(String),
+    Volume {
+        label: String,
+        path: PathBuf,
+    },
+    Chapter {
+        number: u32,
+        path: PathBuf,
+        page: usize,
+        end: usize,
+        saved: Option<usize>,
+    },
+    Read {
+        path: PathBuf,
+    },
+}
+
+impl Entry {
+    fn label(&self) -> String {
+        match self {
+            Self::Directory(path) => format!(
+                "▸ {}/",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            ),
+            Self::Series(name) => format!("▸ {name}"),
+            Self::Volume { label, .. } => format!("▸ {label}"),
+            Self::Chapter {
+                number,
+                page,
+                end,
+                saved,
+                ..
+            } => match saved {
+                Some(current) if (*page..*end).contains(current) => format!(
+                    "  Chapter {number}  ·  {}/{}",
+                    current - page + 1,
+                    end - page
+                ),
+                Some(current) if current >= end => format!("  Chapter {number}  ✓"),
+                _ => format!("  Chapter {number}  ·  {} pages", end - page),
+            },
+            Self::Read { .. } => "  Read volume".into(),
+        }
+    }
+
+    fn book(&self) -> Option<&Path> {
+        match self {
+            Self::Volume { path, .. } | Self::Chapter { path, .. } | Self::Read { path } => {
+                Some(path)
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone)]
+enum Level {
+    Directory,
+    Series(String),
+    Volume(PathBuf),
+}
+
+struct Preview {
+    path: PathBuf,
+    result: Result<(DynamicImage, usize), String>,
+}
+
+struct Library {
+    directory: PathBuf,
+    level: Level,
+    entries: Vec<Entry>,
+    selected: usize,
+    preview: Option<Preview>,
+    preview_target: Option<PathBuf>,
+    cover_cache: HashMap<PathBuf, (DynamicImage, usize)>,
+    results: Receiver<Preview>,
+    sender: mpsc::Sender<Preview>,
+    notice: Option<String>,
+    picker: Picker,
+    image: Option<StatefulProtocol>,
+    progress: Option<usize>,
+}
+
+pub fn select() -> Result<Option<Selection>> {
+    anyhow::ensure!(
+        io::stdin().is_terminal() && io::stdout().is_terminal(),
+        "panel needs an interactive terminal when started without a book"
+    );
+    let home = PathBuf::from(env::var_os("HOME").context("HOME is not set")?);
+    let directory = default_directory()
+        .filter(|path| path.is_dir())
+        .unwrap_or(home);
+    let (sender, results) = mpsc::channel();
+    let mut terminal = ratatui::init();
+    let mut picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::from_fontsize((10, 20)));
+    if env::var("TERM").is_ok_and(|term| term.contains("ghostty")) {
+        picker.set_protocol_type(ProtocolType::Kitty);
+    }
+    let mut library = Library {
+        directory,
+        level: Level::Directory,
+        entries: Vec::new(),
+        selected: 0,
+        preview: None,
+        preview_target: None,
+        cover_cache: HashMap::new(),
+        results,
+        sender,
+        notice: None,
+        picker,
+        image: None,
+        progress: None,
+    };
+    let outcome = library.refresh().and_then(|_| library.run(&mut terminal));
+    ratatui::restore();
+    outcome
+}
+
+impl Library {
+    fn files(&self) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+        let mut directories = Vec::new();
+        let mut books = Vec::new();
+        for item in fs::read_dir(&self.directory)? {
+            let item = item?;
+            if item.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let path = item.path();
+            let Ok(kind) = item.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                directories.push(path);
+            } else if kind.is_file() && is_cbz(&path) {
+                books.push(path);
+            }
+        }
+        directories.sort_by(|a, b| {
+            natord::compare_ignore_case(&a.to_string_lossy(), &b.to_string_lossy())
+        });
+        books.sort_by(|a, b| {
+            natord::compare_ignore_case(&a.to_string_lossy(), &b.to_string_lossy())
+        });
+        Ok((directories, books))
+    }
+
+    fn refresh(&mut self) -> Result<()> {
+        let (directories, books) = self.files()?;
+        self.entries = match &self.level {
+            Level::Directory => {
+                let mut entries: Vec<_> = directories.into_iter().map(Entry::Directory).collect();
+                let mut series: Vec<_> = books.iter().map(|path| series_title(path)).collect();
+                series.sort_by(|a, b| natord::compare_ignore_case(a, b));
+                series.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+                entries.extend(series.into_iter().map(Entry::Series));
+                entries
+            }
+            Level::Series(name) => books
+                .into_iter()
+                .filter(|path| series_title(path).eq_ignore_ascii_case(name))
+                .map(|path| Entry::Volume {
+                    label: volume_title(&path),
+                    path,
+                })
+                .collect(),
+            Level::Volume(path) => {
+                let book = CbzDocument::open(path)?;
+                let mut chapters = BTreeMap::new();
+                for page in 0..book.page_count() {
+                    if let Some(number) = chapter_number(book.page_name(page)) {
+                        chapters.entry(number).or_insert(page);
+                    }
+                }
+                if chapters.is_empty() {
+                    vec![Entry::Read { path: path.clone() }]
+                } else {
+                    let saved = ProgressStore::open()
+                        .ok()
+                        .and_then(|store| store.load(path).ok().flatten())
+                        .map(|position| position.page);
+                    let starts: Vec<_> = chapters.into_iter().collect();
+                    starts
+                        .iter()
+                        .enumerate()
+                        .map(|(index, &(number, page))| {
+                            let end = starts
+                                .get(index + 1)
+                                .map_or(book.page_count(), |(_, next)| *next);
+                            Entry::Chapter {
+                                number,
+                                path: path.clone(),
+                                page,
+                                end,
+                                saved,
+                            }
+                        })
+                        .collect()
+                }
+            }
+        };
+        self.selected = self.selected.min(self.entries.len().saturating_sub(1));
+        self.request_preview();
+        Ok(())
+    }
+
+    fn request_preview(&mut self) {
+        let target = self
+            .entries
+            .get(self.selected)
+            .and_then(|entry| match entry {
+                Entry::Series(name) => self.files().ok().and_then(|(_, books)| {
+                    books
+                        .into_iter()
+                        .find(|path| series_title(path).eq_ignore_ascii_case(name))
+                }),
+                _ => entry.book().map(Path::to_path_buf),
+            });
+        if target == self.preview_target {
+            return;
+        }
+        self.preview = None;
+        self.image = None;
+        self.progress = None;
+        self.preview_target = target;
+        let Some(path) = self.preview_target.clone() else {
+            return;
+        };
+        if let Some(cached) = self.cover_cache.get(&path) {
+            self.accept_preview(Preview {
+                path: path.clone(),
+                result: Ok(cached.clone()),
+            });
+            return;
+        }
+        let sender = self.sender.clone();
+        thread::spawn(move || {
+            let result = (|| -> Result<_, String> {
+                let mut book = CbzDocument::open(&path).map_err(|error| error.to_string())?;
+                let pages = book.page_count();
+                let cover = book.load_cover().map_err(|error| error.to_string())?;
+                Ok((cover.thumbnail(1200, 1600), pages))
+            })();
+            let _ = sender.send(Preview { path, result });
+        });
+    }
+
+    fn accept_preview(&mut self, preview: Preview) {
+        if let Ok((cover, pages)) = &preview.result {
+            if self.cover_cache.len() >= 16 {
+                self.cover_cache.clear();
+            }
+            self.cover_cache
+                .insert(preview.path.clone(), (cover.clone(), *pages));
+            self.image = Some(self.picker.new_resize_protocol(cover.clone()));
+            self.progress = ProgressStore::open()
+                .ok()
+                .and_then(|store| store.load(&preview.path).ok().flatten())
+                .map(|position| position.page + 1);
+        }
+        self.preview = Some(preview);
+    }
+
+    fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<Option<Selection>> {
+        let mut redraw = true;
+        loop {
+            while let Ok(preview) = self.results.try_recv() {
+                if self.preview_target.as_deref() == Some(preview.path.as_path()) {
+                    self.accept_preview(preview);
+                    redraw = true;
+                }
+            }
+            if redraw {
+                terminal.draw(|frame| self.draw(frame))?;
+                redraw = false;
+            }
+            if !event::poll(Duration::from_millis(80))? {
+                continue;
+            }
+            redraw = true;
+            let Event::Key(key) = event::read()? else {
+                continue;
+            };
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => return Ok(None),
+                KeyCode::Char('j') | KeyCode::Down => {
+                    let next = (self.selected + 1).min(self.entries.len().saturating_sub(1));
+                    if next != self.selected {
+                        self.selected = next;
+                        self.request_preview();
+                    }
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    let next = self.selected.saturating_sub(1);
+                    if next != self.selected {
+                        self.selected = next;
+                        self.request_preview();
+                    }
+                }
+                KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => self.parent()?,
+                KeyCode::Char('d') => match set_default_directory(&self.directory) {
+                    Ok(()) => {
+                        self.notice = Some(format!("Default folder: {}", self.directory.display()))
+                    }
+                    Err(error) => {
+                        self.notice = Some(format!("Could not save default folder: {error}"))
+                    }
+                },
+                KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
+                    if let Some(entry) = self.entries.get(self.selected).cloned() {
+                        match entry {
+                            Entry::Directory(path) => {
+                                self.directory = path;
+                                self.level = Level::Directory;
+                                self.selected = 0;
+                                if let Err(error) = self.refresh() {
+                                    self.notice = Some(error.to_string());
+                                }
+                            }
+                            Entry::Series(name) => {
+                                self.level = Level::Series(name);
+                                self.selected = 0;
+                                self.refresh()?;
+                            }
+                            Entry::Volume { path, .. } => {
+                                self.level = Level::Volume(path);
+                                self.selected = 0;
+                                self.refresh()?;
+                            }
+                            Entry::Chapter { path, page, .. } => {
+                                return Ok(Some(Selection {
+                                    path,
+                                    page: Some(page),
+                                }));
+                            }
+                            Entry::Read { path } => {
+                                return Ok(Some(Selection { path, page: None }));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn parent(&mut self) -> Result<()> {
+        match &self.level {
+            Level::Volume(path) => {
+                let path = path.clone();
+                self.level = Level::Series(series_title(&path));
+                self.refresh()?;
+                if let Some(index) = self
+                    .entries
+                    .iter()
+                    .position(|entry| entry.book() == Some(path.as_path()))
+                {
+                    self.selected = index;
+                    self.request_preview();
+                }
+            }
+            Level::Series(name) => {
+                let name = name.clone();
+                self.level = Level::Directory;
+                self.refresh()?;
+                if let Some(index) = self
+                    .entries
+                    .iter()
+                    .position(|entry| matches!(entry, Entry::Series(title) if title == &name))
+                {
+                    self.selected = index;
+                    self.request_preview();
+                }
+            }
+            Level::Directory => {
+                if let Some(parent) = self.directory.parent() {
+                    let old = self.directory.clone();
+                    self.directory = parent.to_path_buf();
+                    self.refresh()?;
+                    if let Some(index) = self
+                        .entries
+                        .iter()
+                        .position(|entry| matches!(entry, Entry::Directory(path) if path == &old))
+                    {
+                        self.selected = index;
+                        self.request_preview();
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn draw(&mut self, frame: &mut Frame) {
+        let area = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Min(1),
+                Constraint::Length(2),
+            ])
+            .split(frame.area());
+        frame.render_widget(
+            Block::default().style(Style::default().bg(BG)),
+            frame.area(),
+        );
+        let location = match &self.level {
+            Level::Directory => self.directory.display().to_string(),
+            Level::Series(name) => format!("{} / {name}", self.directory.display()),
+            Level::Volume(path) => format!(
+                "{} / {} / {}",
+                self.directory.display(),
+                series_title(path),
+                volume_title(path)
+            ),
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    "  PANEL  ",
+                    Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(location, Style::default().fg(FG)),
+            ]))
+            .style(Style::default().bg(BG)),
+            area[0],
+        );
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
+            .split(area[1]);
+        let items: Vec<_> = self
+            .entries
+            .iter()
+            .map(|entry| {
+                let color = if matches!(entry, Entry::Directory(_) | Entry::Series(_)) {
+                    ACCENT
+                } else {
+                    FG
+                };
+                ListItem::new(entry.label()).style(Style::default().fg(color))
+            })
+            .collect();
+        let mut state =
+            ListState::default().with_selected((!items.is_empty()).then_some(self.selected));
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(
+                    Block::default()
+                        .title(" Library ")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(MUTED)),
+                )
+                .highlight_style(
+                    Style::default()
+                        .bg(Color::Rgb(80, 73, 69))
+                        .fg(YELLOW)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            columns[0],
+            &mut state,
+        );
+        self.draw_preview(frame, columns[1]);
+        let hint = self
+            .notice
+            .as_deref()
+            .unwrap_or(" j/k move  ·  l/Enter open  ·  h back  ·  d set default  ·  q quit");
+        frame.render_widget(
+            Paragraph::new(hint)
+                .style(Style::default().fg(MUTED).bg(BG))
+                .wrap(Wrap { trim: true }),
+            area[2],
+        );
+    }
+
+    fn draw_preview(&mut self, frame: &mut Frame, area: Rect) {
+        if self.preview_target.is_none() {
+            return;
+        }
+        let block = Block::default()
+            .title(" Cover ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(MUTED));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let Some(preview) = self.preview.as_ref() else {
+            frame.render_widget(
+                Paragraph::new("Loading cover…").style(Style::default().fg(MUTED)),
+                inner,
+            );
+            return;
+        };
+        let Ok((_, pages)) = &preview.result else {
+            frame.render_widget(
+                Paragraph::new("Could not decode cover").style(Style::default().fg(MUTED)),
+                inner,
+            );
+            return;
+        };
+        frame.render_widget(
+            Paragraph::new(format!("{pages} pages")).style(Style::default().fg(ACCENT)),
+            Rect { height: 1, ..inner },
+        );
+        if let Some(image) = self.image.as_mut() {
+            let image_area = Rect {
+                x: inner.x,
+                y: inner.y.saturating_add(2),
+                width: inner.width,
+                height: inner.height.saturating_sub(3),
+            };
+            if image_area.width > 0 && image_area.height > 0 {
+                frame.render_stateful_widget(
+                    StatefulImage::default().resize(Resize::Fit(None)),
+                    image_area,
+                    image,
+                );
+            }
+        }
+        if let Some(page) = self.progress {
+            frame.render_widget(
+                Paragraph::new(format!("Resume at page {page}/{pages}"))
+                    .style(Style::default().fg(YELLOW)),
+                Rect {
+                    x: inner.x,
+                    y: inner.y + inner.height.saturating_sub(1),
+                    width: inner.width,
+                    height: 1,
+                },
+            );
+        }
+    }
+}
+
+// Heuristics affect presentation only; filenames and files on disk are untouched.
+fn series_title(path: &Path) -> String {
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+    let name = stem.as_ref();
+    let cutoff = name
+        .char_indices()
+        .find(|(index, character)| {
+            let rest = &name[*index..];
+            (*character == 'v' || *character == 'V')
+                && (*index == 0 || name.as_bytes()[index - 1].is_ascii_whitespace())
+                && rest[1..].starts_with(|c: char| c.is_ascii_digit())
+                || matches!(character, '(' | '[')
+        })
+        .map_or(name.len(), |(index, _)| index);
+    let title = name[..cutoff].trim().trim_end_matches(['-', '_']).trim();
+    if title.is_empty() {
+        name.to_owned()
+    } else {
+        title.to_owned()
+    }
+}
+
+fn volume_title(path: &Path) -> String {
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+    let name = stem.as_ref();
+    let volume = name.split_whitespace().find_map(|token| {
+        let digits = token.strip_prefix(['v', 'V'])?;
+        (!digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())).then_some(digits)
+    });
+    match volume {
+        Some(number) => format!("Volume {number}"),
+        None => "Volume (unspecified)".into(),
+    }
+}
+
+fn chapter_number(name: &str) -> Option<u32> {
+    let bytes = name.as_bytes();
+    for index in 0..bytes.len().saturating_sub(1) {
+        if (bytes[index] == b'c' || bytes[index] == b'C')
+            && (index == 0 || !bytes[index - 1].is_ascii_alphanumeric())
+            && bytes[index + 1].is_ascii_digit()
+        {
+            let end = (index + 1..bytes.len())
+                .find(|&n| !bytes[n].is_ascii_digit())
+                .unwrap_or(bytes.len());
+            return name[index + 1..end].parse().ok();
+        }
+    }
+    None
+}
+
+fn configuration_path() -> Option<PathBuf> {
+    let base = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+    Some(base.join("panel/default-directory"))
+}
+
+fn default_directory() -> Option<PathBuf> {
+    let contents = fs::read(configuration_path()?).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Some(PathBuf::from(std::ffi::OsString::from_vec(contents)))
+    }
+    #[cfg(not(unix))]
+    {
+        String::from_utf8(contents).ok().map(PathBuf::from)
+    }
+}
+
+fn set_default_directory(directory: &Path) -> Result<()> {
+    let path = configuration_path().context("neither XDG_CONFIG_HOME nor HOME is set")?;
+    fs::create_dir_all(path.parent().context("invalid configuration path")?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        fs::write(&path, directory.canonicalize()?.as_os_str().as_bytes())?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(
+            &path,
+            directory.canonicalize()?.to_string_lossy().as_bytes(),
+        )?;
+    }
+    Ok(())
+}
+
+fn is_cbz(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("cbz"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{chapter_number, series_title, volume_title};
+    use std::path::Path;
+
+    #[test]
+    fn groups_single_volume() {
+        let book = Path::new("Berserk v41 (2022) (Digital).cbz");
+        assert_eq!(series_title(book), "Berserk");
+        assert_eq!(volume_title(book), "Volume 41");
+        assert_eq!(chapter_number("Berserk - c358 (v41) - p000.jpg"), Some(358));
+        assert_eq!(chapter_number("page-001.jpg"), None);
+    }
+}

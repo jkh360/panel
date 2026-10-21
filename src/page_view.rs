@@ -65,8 +65,12 @@ mod imp {
             let padding = 32.0;
             let available_width = (viewport_width - padding * 2.0).max(1.0);
             let available_height = (viewport_height - padding * 2.0).max(1.0);
-            let scale = (available_width / target.width as f32)
+            let mut scale = (available_width / target.width as f32)
                 .min(available_height / target.height as f32);
+            if mode == ViewMode::Focus {
+                let page_fit = (available_width / page_width).min(available_height / page_height);
+                scale = scale.min(page_fit * 2.0);
+            }
             let target_center_x = target.x as f32 + target.width as f32 / 2.0;
             let target_center_y = target.y as f32 + target.height as f32 / 2.0;
             let page_x = viewport_width / 2.0 - target_center_x * scale;

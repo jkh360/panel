@@ -41,6 +41,23 @@ pub fn initialize(connection: &Connection) -> Result<()> {
              PRIMARY KEY(document_path, document_size, document_modified, page)
          );",
     )?;
+    // Older installations stored external results under this name. Preserve
+    // them on upgrade; never replace a newer result for the same page.
+    let legacy_exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'imported_detections')",
+        [],
+        |row| row.get(0),
+    )?;
+    if legacy_exists {
+        connection.execute_batch(
+            "INSERT OR IGNORE INTO external_detections
+                 (document_path, document_size, document_modified, page,
+                  width, height, source, regions)
+             SELECT document_path, document_size, document_modified, page,
+                    width, height, source, regions
+             FROM imported_detections;",
+        )?;
+    }
     Ok(())
 }
 

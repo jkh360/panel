@@ -2,6 +2,7 @@ mod detection_cache;
 mod detector;
 mod document;
 mod import_regions;
+mod library;
 mod page_view;
 mod progress;
 mod region;
@@ -92,8 +93,9 @@ fn main() {
         }
         return;
     }
-    let path = match input_path() {
-        Ok(path) => path,
+    let selection = match input_path() {
+        Ok(Some(selection)) => selection,
+        Ok(None) => return,
         Err(error) => {
             eprintln!("panel: {error:#}");
             process::exit(2);
@@ -104,7 +106,7 @@ fn main() {
         .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
         .build();
     application.connect_activate(move |application| {
-        if let Err(error) = build_reader(application, path.clone()) {
+        if let Err(error) = build_reader(application, selection.path.clone(), selection.page) {
             eprintln!("panel: {error:#}");
             application.quit();
         }
@@ -194,10 +196,10 @@ fn json_escape(value: &str) -> String {
         .replace('\n', "\\n")
 }
 
-fn input_path() -> Result<PathBuf> {
+fn input_path() -> Result<Option<library::Selection>> {
     let mut arguments = env::args_os().skip(1);
     let Some(path) = arguments.next() else {
-        bail!("the terminal library selector is not implemented yet; usage: panel BOOK.cbz");
+        return library::select();
     };
     if arguments.next().is_some() {
         bail!("expected exactly one document path");
@@ -210,10 +212,14 @@ fn input_path() -> Result<PathBuf> {
     {
         bail!("the first build supports CBZ input only");
     }
-    Ok(path)
+    Ok(Some(library::Selection { path, page: None }))
 }
 
-fn build_reader(application: &Application, path: PathBuf) -> Result<()> {
+fn build_reader(
+    application: &Application,
+    path: PathBuf,
+    initial_page: Option<usize>,
+) -> Result<()> {
     install_css();
     let mut document = CbzDocument::open(&path)?;
     let page_count = document.page_count();
@@ -221,7 +227,7 @@ fn build_reader(application: &Application, path: PathBuf) -> Result<()> {
     let progress = ProgressStore::open()?;
     let restored = progress.load(&path)?.unwrap_or_default();
     let position = Position {
-        page: restored.page.min(page_count - 1),
+        page: initial_page.unwrap_or(restored.page).min(page_count - 1),
         region: 0,
     };
     let image = document.load_page(position.page)?;
@@ -301,6 +307,12 @@ fn build_reader(application: &Application, path: PathBuf) -> Result<()> {
         .child(&layout)
         .build();
     present(&reader.borrow(), &view, &status, false);
+    {
+        let reader = reader.borrow();
+        if let Err(error) = reader.progress.save(&reader.path, reader.position, false) {
+            eprintln!("panel: failed to save opening position: {error:#}");
+        }
+    }
 
     {
         let reader = Rc::clone(&reader);

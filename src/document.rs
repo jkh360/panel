@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use gtk::{gdk, glib, prelude::*};
-use image::RgbaImage;
+use image::{DynamicImage, RgbaImage};
 use zip::ZipArchive;
 
 pub struct CbzDocument {
@@ -58,7 +58,7 @@ impl CbzDocument {
         &self.entries[page]
     }
 
-    pub fn load_page(&mut self, page: usize) -> Result<RgbaImage> {
+    fn page_bytes(&mut self, page: usize) -> Result<Vec<u8>> {
         let name = &self.entries[page];
         let mut entry = self
             .archive
@@ -66,9 +66,41 @@ impl CbzDocument {
             .with_context(|| format!("archive entry disappeared: {name}"))?;
         let mut encoded = Vec::with_capacity(entry.size().try_into().unwrap_or(0));
         entry.read_to_end(&mut encoded)?;
+        Ok(encoded)
+    }
+
+    pub fn load_page(&mut self, page: usize) -> Result<RgbaImage> {
+        let encoded = self.page_bytes(page)?;
         image::load_from_memory(&encoded)
-            .with_context(|| format!("failed to decode {name}"))
+            .with_context(|| format!("failed to decode {}", self.entries[page]))
             .map(|image| image.into_rgba8())
+    }
+
+    pub fn load_cover(&mut self) -> Result<DynamicImage> {
+        let jpeg = self.entries[0].rsplit_once('.').is_some_and(|(_, ext)| {
+            ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("jpeg")
+        });
+        if jpeg {
+            let encoded = self.page_bytes(0)?;
+            let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(encoded));
+            decoder.scale(600, 800)?;
+            let pixels = decoder.decode()?;
+            let info = decoder.info().context("JPEG cover has no dimensions")?;
+            let (width, height) = (u32::from(info.width), u32::from(info.height));
+            let cover = match info.pixel_format {
+                jpeg_decoder::PixelFormat::RGB24 => {
+                    image::RgbImage::from_raw(width, height, pixels).map(DynamicImage::ImageRgb8)
+                }
+                jpeg_decoder::PixelFormat::L8 => {
+                    image::GrayImage::from_raw(width, height, pixels).map(DynamicImage::ImageLuma8)
+                }
+                _ => None,
+            };
+            if let Some(cover) = cover {
+                return Ok(cover);
+            }
+        }
+        self.load_page(0).map(DynamicImage::ImageRgba8)
     }
 }
 
@@ -100,6 +132,17 @@ fn is_supported_image(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::is_supported_image;
+
+    #[test]
+    fn cover_decodes_when_sample_book_is_provided() {
+        let Some(path) = std::env::var_os("PANEL_TEST_BOOK") else {
+            return;
+        };
+        let mut book = super::CbzDocument::open(std::path::Path::new(&path)).unwrap();
+        let cover = book.load_cover().unwrap();
+        assert!(cover.width() > 0 && cover.height() > 0);
+        assert!(cover.width() <= 1200 && cover.height() <= 1600);
+    }
 
     #[test]
     fn image_extensions_are_case_insensitive() {
