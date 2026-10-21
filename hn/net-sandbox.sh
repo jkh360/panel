@@ -16,7 +16,11 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 umask 077
 STATE=$(mktemp -d)
 printf 'nameserver 10.0.2.3\noptions attempts:1 timeout:3\n' > "$STATE/resolv.conf"
+chmod 0644 "$STATE/resolv.conf"
 export PANEL_HN_RESOLV="$STATE/resolv.conf"
+export PANEL_HN_NET_ISOLATED=1
+export PANEL_HN_HOST_UID=$(id -u)
+export PANEL_HN_HOST_GID=$(id -g)
 worker= slirp=
 cleanup() {
     [ -z "$slirp" ] || kill "$slirp" 2>/dev/null || true
@@ -25,6 +29,9 @@ cleanup() {
     rm -rf -- "$STATE"
 }
 trap cleanup EXIT HUP INT TERM
+# POSIX background jobs receive /dev/null on stdin unless explicitly redirected.
+# Preserve Panel's private request pipe for the browser, not for slirp/Xvfb.
+exec 3<&0
 # Inside the new user+network namespace, set policy BEFORE starting the child.
 # DNS to slirp's virtual resolver is the sole exception in its private subnet.
 unshare --user --map-root-user --net --fork sh -c '
@@ -39,9 +46,11 @@ unshare --user --map-root-user --net --fork sh -c '
         iptables -A OUTPUT -d "$subnet" -j REJECT
     done
     shift
+    exec 3<&-
     exec "$@"
-' sh "$STATE" "$ROOT/hn/sandbox.sh" "$@" &
+' sh "$STATE" "$ROOT/hn/sandbox.sh" "$@" <&3 &
 worker=$!
+exec 3<&-
 # Slirp attaches only to the child's new net namespace; it has no host ports.
 n=0
 while [ ! -s "$STATE/pid" ]; do
@@ -53,7 +62,7 @@ while [ ! -s "$STATE/pid" ]; do
     sleep 0.05
 done
 netpid=$(head -n 1 "$STATE/pid")
-slirp4netns --configure --disable-host-loopback "$netpid" tap0 > "$STATE/slirp.log" 2>&1 &
+slirp4netns --configure --disable-host-loopback "$netpid" tap0 < /dev/null > "$STATE/slirp.log" 2>&1 &
 slirp=$!
 n=0
 while ! grep -q '^tap0[[:space:]]' "/proc/$netpid/net/route" 2>/dev/null; do

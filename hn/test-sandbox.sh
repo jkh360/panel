@@ -47,8 +47,10 @@ export PANEL_HN_SECRET_TEST=must_not_cross_boundary
     (async () => {
         assert.equal(process.env.PANEL_HN_SECRET_TEST, undefined);
         assert.deepEqual(fs.readdirSync("/home"), []);
-        assert.equal(process.env.HOME, "/home/panel-hn");
-        assert.equal(fs.existsSync("/app/web/index.html"), true);
+        assert.equal(process.env.HOME, "/tmp/panel-hn");
+        assert.notEqual(process.getuid(), 0);
+        assert.equal(fs.existsSync("/app/backend/web/index.html"), true);
+        assert.equal(process.env.PANEL_HN_NET_ISOLATED, "1");
         assert.match(fs.readFileSync("/etc/resolv.conf", "utf8"), /10\.0\.2\.3/);
         const [port, ip] = process.argv.slice(1);
         const urls = [`http://127.0.0.1:${port}/`];

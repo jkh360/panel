@@ -17,6 +17,18 @@
 !/hn/sandbox.sh
 !/hn/net-sandbox.sh
 !/hn/test-sandbox.sh
+!/hn/test-backend.sh
+!/hn/web/
+!/hn/web/index.html
+!/hn/web/entry.ts
+!/hn/web/vite.config.mjs
+!/hn/web/no-frontend.ts
+!/hn/app/
+!/hn/app/main.ts
+!/hn/app/preload.ts
+!/hn/app/package.json
+!/hn/app/vite.config.mjs
+!/hn/app/run.sh
 
 !/vendor/
 !/vendor/haruneko

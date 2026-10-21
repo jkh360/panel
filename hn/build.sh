@@ -20,8 +20,9 @@ fi
 export npm_config_ignore_scripts=true
 cd "$UPSTREAM"
 npm install --ignore-scripts --no-audit --no-fund
-npm --workspace=web run build
-# The web build verifies that the pinned engine and all its connectors compile.
-# The upstream Electron app is intentionally not built or started: its current
-# startup configuration does not meet Panel's security requirements.
-printf 'panel-hn: compiled pinned connectors; secure browser backend is not enabled yet\n'
+./node_modules/.bin/vite build --config ../../hn/web/vite.config.mjs --configLoader runner
+./node_modules/.bin/vite build --config ../../hn/app/vite.config.mjs --configLoader runner
+cp "$ROOT/hn/app/package.json" "$ROOT/hn/app/run.sh" "$ROOT/hn/generated/app/"
+# Only the pinned engine/connectors and Panel's custom Electron entry are built.
+# The upstream GUI, remote app entry point and RPC server are excluded.
+printf 'panel-hn: built headless engine and local Electron bridge\n'
