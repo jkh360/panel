@@ -21,10 +21,12 @@ Requirements before enabling the backend:
   only a private parent/child IPC channel to Panel. Never listen on a network port.
 - Sandbox pages from websites. Allow requested website network access but never
   mount Panel's SQLite database, manga library, SSH keys, or browser profiles
-  into the browsing process. `hn/sandbox.sh` is a filesystem/environment
-  isolation probe; it does not yet isolate networking. Before running a browser,
-  also prevent untrusted website pages from reaching local services on loopback
-  or the LAN while allowing intended public websites.
+  into the browsing process. `hn/sandbox.sh` alone does **not** restrict network
+  access; only use it through `hn/net-sandbox.sh` for a networked child. That
+  launcher uses a separate user/network namespace, slirp with host loopback
+  disabled, and pre-launch firewall rules denying private IPv4 destinations
+  except its DNS resolver. IPv6 has no external route. Its network policy is
+  experimental, not a guarantee that arbitrary site scripts are safe.
 - Confirm downloaded data are images, bound their size and count, write CBZ
   files atomically, and prevent traversal or overwrite through remote filenames.
 - Run only when a user explicitly opens Search. Keep the reader offline.

@@ -36,7 +36,13 @@ for directory in /nix/store /usr /lib /lib64 /bin /sbin; do
     fi
 done
 # DNS and TLS trust, without granting access to other host configuration.
-for file in /etc/resolv.conf /etc/hosts /etc/nsswitch.conf /etc/ssl/certs/ca-certificates.crt; do
+# Network namespaces must use their own resolver; never expose the host DNS IP.
+if [ -n "${PANEL_HN_RESOLV:-}" ]; then
+    set -- --ro-bind "$PANEL_HN_RESOLV" /etc/resolv.conf "$@"
+else
+    set -- --ro-bind /etc/resolv.conf /etc/resolv.conf "$@"
+fi
+for file in /etc/hosts /etc/nsswitch.conf /etc/ssl/certs/ca-certificates.crt; do
     if [ -f "$file" ]; then
         set -- --ro-bind "$file" "$file" "$@"
     fi
