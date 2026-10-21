@@ -52,6 +52,10 @@ enum Entry {
         end: usize,
         saved: Option<usize>,
     },
+    LastRead {
+        path: PathBuf,
+        description: String,
+    },
     Read {
         path: PathBuf,
     },
@@ -81,15 +85,17 @@ impl Entry {
                 Some(current) if current >= end => format!("  Chapter {number}  ✓"),
                 _ => format!("  Chapter {number}  ·  {} pages", end - page),
             },
+            Self::LastRead { description, .. } => format!("↳ Last read\n    {description}"),
             Self::Read { .. } => "  Read volume".into(),
         }
     }
 
     fn book(&self) -> Option<&Path> {
         match self {
-            Self::Volume { path, .. } | Self::Chapter { path, .. } | Self::Read { path } => {
-                Some(path)
-            }
+            Self::Volume { path, .. }
+            | Self::Chapter { path, .. }
+            | Self::LastRead { path, .. }
+            | Self::Read { path } => Some(path),
             _ => None,
         }
     }
@@ -207,37 +213,53 @@ impl Library {
                 .collect(),
             Level::Volume(path) => {
                 let book = CbzDocument::open(path)?;
+                let saved = ProgressStore::open()
+                    .ok()
+                    .and_then(|store| store.load(path).ok().flatten())
+                    .filter(|position| position.page < book.page_count());
                 let mut chapters = BTreeMap::new();
                 for page in 0..book.page_count() {
                     if let Some(number) = chapter_number(book.page_name(page)) {
                         chapters.entry(number).or_insert(page);
                     }
                 }
-                if chapters.is_empty() {
-                    vec![Entry::Read { path: path.clone() }]
-                } else {
-                    let saved = ProgressStore::open()
-                        .ok()
-                        .and_then(|store| store.load(path).ok().flatten())
-                        .map(|position| position.page);
-                    let starts: Vec<_> = chapters.into_iter().collect();
-                    starts
+                let mut entries = Vec::new();
+                if let Some(position) = saved {
+                    let chapter = chapters
                         .iter()
-                        .enumerate()
-                        .map(|(index, &(number, page))| {
-                            let end = starts
-                                .get(index + 1)
-                                .map_or(book.page_count(), |(_, next)| *next);
-                            Entry::Chapter {
-                                number,
-                                path: path.clone(),
-                                page,
-                                end,
-                                saved,
-                            }
+                        .rev()
+                        .find(|(_, start)| **start <= position.page)
+                        .map(|(number, start)| {
+                            format!(
+                                "Chapter {number} · page {} (book page {})",
+                                position.page - start + 1,
+                                position.page + 1
+                            )
                         })
-                        .collect()
+                        .unwrap_or_else(|| format!("Book page {}", position.page + 1));
+                    entries.push(Entry::LastRead {
+                        path: path.clone(),
+                        description: chapter,
+                    });
                 }
+                if chapters.is_empty() {
+                    entries.push(Entry::Read { path: path.clone() });
+                } else {
+                    let starts: Vec<_> = chapters.into_iter().collect();
+                    entries.extend(starts.iter().enumerate().map(|(index, &(number, page))| {
+                        let end = starts
+                            .get(index + 1)
+                            .map_or(book.page_count(), |(_, next)| *next);
+                        Entry::Chapter {
+                            number,
+                            path: path.clone(),
+                            page,
+                            end,
+                            saved: saved.map(|position| position.page),
+                        }
+                    }));
+                }
+                entries
             }
         };
         self.selected = self.selected.min(self.entries.len().saturating_sub(1));
@@ -370,6 +392,9 @@ impl Library {
                                 self.level = Level::Volume(path);
                                 self.selected = 0;
                                 self.refresh()?;
+                            }
+                            Entry::LastRead { path, .. } => {
+                                return Ok(Some(Selection { path, page: None }));
                             }
                             Entry::Chapter { path, page, .. } => {
                                 return Ok(Some(Selection {

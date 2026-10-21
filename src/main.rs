@@ -51,7 +51,6 @@ struct Page {
     regions: Vec<Region>,
     source: String,
     fallback_reason: Option<String>,
-    cached: bool,
 }
 
 struct Reader {
@@ -226,12 +225,13 @@ fn build_reader(
     let title = document.title();
     let progress = ProgressStore::open()?;
     let restored = progress.load(&path)?.unwrap_or_default();
+    let selected_page = initial_page.unwrap_or(restored.page).min(page_count - 1);
+    let image = document.load_page(selected_page)?;
+    let detection = load_or_detect(progress.connection(), &path, selected_page, &image);
     let position = Position {
-        page: initial_page.unwrap_or(restored.page).min(page_count - 1),
-        region: 0,
+        page: selected_page,
+        region: restored_region(restored, initial_page, detection.regions.len()),
     };
-    let image = document.load_page(position.page)?;
-    let detection = load_or_detect(progress.connection(), &path, position.page, &image);
     let page = make_page(image, detection);
     let reader = Rc::new(RefCell::new(Reader {
         progress,
@@ -291,6 +291,7 @@ fn build_reader(
     let pending = Rc::new(Cell::new(false));
 
     let view = PageView::new();
+    view.set_zoom(reader.borrow().progress.load_zoom(&path)?);
     let zoom_indicator = Label::new(None);
     zoom_indicator.set_halign(gtk::Align::Start);
     zoom_indicator.set_valign(gtk::Align::Start);
@@ -343,15 +344,24 @@ fn build_reader(
                             page: loaded.number,
                             region: 0,
                         };
-                        reader.page = make_page(
-                            loaded.image,
-                            DetectionResult {
-                                regions: loaded.regions,
-                                source: loaded.source,
-                                fallback_reason: loaded.fallback_reason,
-                                cached: true,
-                            },
-                        );
+                        let mut detection = DetectionResult {
+                            regions: loaded.regions,
+                            source: loaded.source,
+                            fallback_reason: loaded.fallback_reason,
+                            cached: true,
+                        };
+                        if let Ok(Some(external)) = detection_cache::load_external(
+                            reader.progress.connection(),
+                            &reader.path,
+                            loaded.number,
+                            loaded.image.width(),
+                            loaded.image.height(),
+                        ) {
+                            detection.regions = external.regions;
+                            detection.source = external.source;
+                            detection.fallback_reason = None;
+                        }
+                        reader.page = make_page(loaded.image, detection);
                         present(&reader, &view, &status, false);
                         let completed = reader.position.page + 1 == reader.page_count;
                         if let Err(error) =
@@ -393,10 +403,12 @@ fn build_reader(
                                 regions: result.regions,
                                 source: result.source,
                                 fallback_reason: None,
-                                cached: true,
                             };
-                            reader.position.region = 0;
+                            reader.position.region =
+                                reader.position.region.min(reader.page.regions.len() - 1);
                             present(&reader, &view, &status, false);
+                        } else {
+                            update_status(&reader, &status, view.mode(), false);
                         }
                     }
                     Err(error) => eprintln!("panel: detector worker: {error}"),
@@ -430,6 +442,10 @@ fn build_reader(
             };
             if zoom_step != 0 {
                 let zoom = view.change_zoom(zoom_step);
+                let reader = reader.borrow();
+                if let Err(error) = reader.progress.save_zoom(&reader.path, zoom) {
+                    eprintln!("panel: failed to save zoom: {error:#}");
+                }
                 let displayed = if view.mode() == ViewMode::Focus {
                     zoom * 2.0
                 } else {
@@ -511,7 +527,17 @@ fn build_reader(
         let worker = Rc::clone(&worker);
         let detector_requests = Rc::clone(&detector_requests);
         let detector_worker = Rc::clone(&detector_worker);
+        let reader = Rc::clone(&reader);
         window.connect_close_request(move |_| {
+            let reader = reader.borrow();
+            if let Err(error) = reader.progress.save(
+                &reader.path,
+                reader.position,
+                reader.position.page + 1 == reader.page_count,
+            ) {
+                eprintln!("panel: failed to save reading position: {error:#}");
+            }
+            drop(reader);
             let _ = requests.try_send(WorkerRequest::Stop);
             if let Some(worker) = worker.borrow_mut().take() {
                 let _ = worker.join();
@@ -605,7 +631,6 @@ fn make_page(image: RgbaImage, detection: DetectionResult) -> Page {
         regions: detection.regions,
         source: detection.source,
         fallback_reason: detection.fallback_reason,
-        cached: detection.cached,
     }
 }
 
@@ -625,28 +650,55 @@ fn update_status(reader: &Reader, status: &Label, mode: ViewMode, loading: bool)
         ViewMode::Focus => "focus",
         ViewMode::Page => "page",
     };
-    let detector = reader.page.fallback_reason.as_ref().map_or_else(
+    let current = reader.page.fallback_reason.as_ref().map_or_else(
         || reader.page.source.clone(),
-        |reason| format!("{}: {reason}", reader.page.source),
+        |reason| format!("whole page · {reason}"),
     );
-    let cache = if reader.page.cached { " · cached" } else { "" };
-    let loading = if loading { "  ·  loading…" } else { "" };
+    let remaining = (reader.page_count - reader.position.page - 1).min(10);
+    let ahead = if remaining == 0 {
+        String::new()
+    } else {
+        match detection_cache::count_ahead(
+            reader.progress.connection(),
+            &reader.path,
+            reader.position.page,
+            remaining,
+        ) {
+            Ok(ready) if detector::configured() || ready > 0 => {
+                format!(" · ahead {ready}/{remaining} ready")
+            }
+            Ok(_) => String::new(),
+            Err(error) => {
+                eprintln!("panel: failed to read detector coverage: {error:#}");
+                String::new()
+            }
+        }
+    };
+    let loading = if loading { " · loading page…" } else { "" };
     status.set_text(&format!(
-        "{}  —  {}/{}  ·  {}/{}  ·  {}  ·  {}{}{}",
+        "{} — page {}/{} · panel {}/{} · {} · {}{}{}",
         reader.title,
         reader.position.page + 1,
         reader.page_count,
         reader.position.region + 1,
         reader.page.regions.len(),
         mode,
-        detector,
-        cache,
+        current,
+        ahead,
         loading,
     ));
 }
 
 fn texture(image: RgbaImage) -> gdk::Texture {
     document::texture(image)
+}
+
+fn restored_region(restored: Position, initial_page: Option<usize>, region_count: usize) -> usize {
+    if initial_page.is_some() {
+        0
+    } else {
+        restored.region.min(region_count.saturating_sub(1))
+    }
 }
 
 fn move_region(reader: &mut Reader, delta: isize) -> bool {
@@ -672,5 +724,22 @@ fn install_css() {
             &provider,
             STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::restored_region;
+    use crate::progress::Position;
+
+    #[test]
+    fn restores_saved_panel_unless_a_chapter_was_chosen() {
+        let saved = Position {
+            page: 12,
+            region: 3,
+        };
+        assert_eq!(restored_region(saved, None, 5), 3);
+        assert_eq!(restored_region(saved, None, 2), 1);
+        assert_eq!(restored_region(saved, Some(12), 5), 0);
     }
 }

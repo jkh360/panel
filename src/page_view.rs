@@ -111,6 +111,11 @@ impl PageView {
         if zoom == 0.0 { 1.0 } else { zoom }
     }
 
+    pub fn set_zoom(&self, zoom: f32) {
+        self.imp().zoom.set(zoom.clamp(0.5, 3.0));
+        self.queue_draw();
+    }
+
     pub fn change_zoom(&self, steps: i32) -> f32 {
         let zoom = ((self.zoom() * 10.0).round() as i32 + steps * 2).clamp(5, 30) as f32 / 10.0;
         self.imp().zoom.set(zoom);

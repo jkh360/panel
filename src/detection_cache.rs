@@ -96,6 +96,31 @@ pub fn load_external(
     .transpose()
 }
 
+/// Count externally analyzed pages after `page` within the next `lookahead` pages.
+/// The document identity excludes obsolete results from changed books.
+pub fn count_ahead(
+    connection: &Connection,
+    path: &Path,
+    page: usize,
+    lookahead: usize,
+) -> Result<usize> {
+    let identity = identity(path)?;
+    let count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM external_detections
+         WHERE document_path = ?1 AND document_size = ?2 AND document_modified = ?3
+           AND page > ?4 AND page <= ?5",
+        params![
+            identity.path,
+            identity.size,
+            identity.modified,
+            page as i64,
+            page.saturating_add(lookahead) as i64
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(count as usize)
+}
+
 pub fn save_external(
     connection: &Connection,
     path: &Path,
@@ -273,6 +298,28 @@ fn decode_regions(encoded: &str) -> Result<Vec<Region>> {
 mod tests {
     use super::{decode_regions, encode_regions};
     use crate::region::Region;
+
+    #[test]
+    fn ahead_counts_only_external_pages_in_window() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        super::initialize(&connection).unwrap();
+        let path =
+            std::env::temp_dir().join(format!("panel-test-{}-ahead.cbz", std::process::id()));
+        std::fs::write(&path, b"test").unwrap();
+        let region = Region {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        for page in [0, 2, 4, 7] {
+            super::save_external(&connection, &path, page, 10, 10, "test", &[region]).unwrap();
+        }
+        assert_eq!(super::count_ahead(&connection, &path, 0, 5).unwrap(), 2);
+        assert_eq!(super::count_ahead(&connection, &path, 4, 2).unwrap(), 0);
+        assert_eq!(super::count_ahead(&connection, &path, 4, 3).unwrap(), 1);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn regions_round_trip() {
