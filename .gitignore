@@ -13,6 +13,7 @@
 
 !/hn/
 !/hn/SECURITY.md
+!/hn/build.sh
 
 !/vendor/
 !/vendor/haruneko

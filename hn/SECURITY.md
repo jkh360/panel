@@ -3,6 +3,9 @@
 Source: https://github.com/manga-download/haruneko, pinned in `vendor/haruneko`.
 The upstream Unlicense covers its code, **not** content served by websites.
 This experimental branch does not enable search or downloads yet.
+`hn/build.sh` verifies the pinned source and compiles upstream connectors with
+Node.js 24 (`nix shell nixpkgs#nodejs_24 -c ./hn/build.sh` on Nix). It does not
+execute the upstream desktop application or expose a browser profile.
 
 The official Electron `Main.ts` must **not** be run unmodified as Panel's backend:
 it defaults to a remotely hosted web app and disables Chromium's sandbox and
