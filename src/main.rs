@@ -291,13 +291,26 @@ fn build_reader(
     let pending = Rc::new(Cell::new(false));
 
     let view = PageView::new();
+    let zoom_indicator = Label::new(None);
+    zoom_indicator.set_halign(gtk::Align::Start);
+    zoom_indicator.set_valign(gtk::Align::Start);
+    zoom_indicator.set_margin_start(16);
+    zoom_indicator.set_margin_top(16);
+    zoom_indicator.set_can_target(false);
+    zoom_indicator.add_css_class("zoom-indicator");
+    zoom_indicator.set_visible(false);
+    let zoom_timeout = Rc::new(Cell::new(0_u64));
+    let overlay = gtk::Overlay::new();
+    overlay.set_child(Some(&view));
+    overlay.add_overlay(&zoom_indicator);
     let status = Label::new(None);
     status.set_halign(gtk::Align::Center);
-    status.set_margin_bottom(8);
+    status.set_margin_top(4);
+    status.set_margin_bottom(4);
     status.add_css_class("status");
     let layout = gtk::Box::new(Orientation::Vertical, 0);
     layout.add_css_class("reader");
-    layout.append(&view);
+    layout.append(&overlay);
     layout.append(&status);
     let window = ApplicationWindow::builder()
         .application(application)
@@ -402,10 +415,37 @@ fn build_reader(
         let generation = Rc::clone(&generation);
         let pending = Rc::clone(&pending);
         let detector_requests = Rc::clone(&detector_requests);
+        let zoom_indicator = zoom_indicator.clone();
+        let zoom_timeout = Rc::clone(&zoom_timeout);
         let window = window.clone();
         keys.connect_key_pressed(move |_, key, _, _| {
             if matches!(key, gdk::Key::q | gdk::Key::Escape) {
                 window.close();
+                return glib::Propagation::Stop;
+            }
+            let zoom_step = match key {
+                gdk::Key::plus | gdk::Key::equal | gdk::Key::KP_Add => 1,
+                gdk::Key::minus | gdk::Key::KP_Subtract => -1,
+                _ => 0,
+            };
+            if zoom_step != 0 {
+                let zoom = view.change_zoom(zoom_step);
+                let displayed = if view.mode() == ViewMode::Focus {
+                    zoom * 2.0
+                } else {
+                    zoom
+                };
+                zoom_indicator.set_text(&format!("Zoom {displayed:.1}×"));
+                zoom_indicator.set_visible(true);
+                let generation = zoom_timeout.get().wrapping_add(1);
+                zoom_timeout.set(generation);
+                let zoom_indicator = zoom_indicator.clone();
+                let zoom_timeout = Rc::clone(&zoom_timeout);
+                glib::timeout_add_local_once(std::time::Duration::from_millis(1200), move || {
+                    if zoom_timeout.get() == generation {
+                        zoom_indicator.set_visible(false);
+                    }
+                });
                 return glib::Propagation::Stop;
             }
             let mode = match key {
@@ -433,7 +473,8 @@ fn build_reader(
                 gdk::Key::k | gdk::Key::l => -1,
                 _ => return glib::Propagation::Proceed,
             };
-            let region_key = matches!(key, gdk::Key::j | gdk::Key::k);
+            let region_key =
+                view.mode() != ViewMode::Page && matches!(key, gdk::Key::j | gdk::Key::k);
             let mut reader = reader.borrow_mut();
             if region_key && move_region(&mut reader, delta) {
                 present(&reader, &view, &status, false);
@@ -623,7 +664,7 @@ fn move_region(reader: &mut Reader, delta: isize) -> bool {
 fn install_css() {
     let provider = CssProvider::new();
     provider.load_from_data(&format!(
-        ".reader {{ background-color: {GRUVBOX_DARK}; }}\n.status {{ color: #a89984; }}"
+        ".reader {{ background-color: {GRUVBOX_DARK}; }}\n.status {{ background-color: #3c3836; color: #ebdbb2; padding: 6px 12px; }}\n.zoom-indicator {{ background-color: #3c3836; color: #ebdbb2; padding: 6px 10px; border-radius: 4px; }}"
     ));
     if let Some(display) = gdk::Display::default() {
         gtk::style_context_add_provider_for_display(

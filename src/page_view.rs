@@ -20,6 +20,7 @@ mod imp {
         pub texture: RefCell<Option<gdk::Texture>>,
         pub region: Cell<Option<Region>>,
         pub mode: Cell<ViewMode>,
+        pub zoom: Cell<f32>,
     }
 
     #[glib::object_subclass]
@@ -71,6 +72,8 @@ mod imp {
                 let page_fit = (available_width / page_width).min(available_height / page_height);
                 scale = scale.min(page_fit * 2.0);
             }
+            let zoom = self.zoom.get();
+            scale *= if zoom == 0.0 { 1.0 } else { zoom };
             let target_center_x = target.x as f32 + target.width as f32 / 2.0;
             let target_center_y = target.y as f32 + target.height as f32 / 2.0;
             let page_x = viewport_width / 2.0 - target_center_x * scale;
@@ -101,6 +104,18 @@ impl PageView {
             .property("hexpand", true)
             .property("vexpand", true)
             .build()
+    }
+
+    pub fn zoom(&self) -> f32 {
+        let zoom = self.imp().zoom.get();
+        if zoom == 0.0 { 1.0 } else { zoom }
+    }
+
+    pub fn change_zoom(&self, steps: i32) -> f32 {
+        let zoom = ((self.zoom() * 10.0).round() as i32 + steps * 2).clamp(5, 30) as f32 / 10.0;
+        self.imp().zoom.set(zoom);
+        self.queue_draw();
+        zoom
     }
 
     pub fn set_page(&self, texture: gdk::Texture, region: Region) {
