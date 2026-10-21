@@ -16,10 +16,18 @@ if [ "$(node -p 'process.versions.node.split(".")[0]')" -lt 24 ]; then
     echo 'panel-hn: Node.js 24 or later is required' >&2
     exit 1
 fi
-# Installation hooks in the upstream dependency graph are not audited for Panel.
+# Do not fetch dependencies through a TLS trust store containing the emSign G3
+# root affected by compromised intermediate keys (GHSA-6q48-6c7w-9gw2).
+# Local recompilation using already installed dependencies remains possible.
 export npm_config_ignore_scripts=true
 cd "$UPSTREAM"
-npm install --ignore-scripts --no-audit --no-fund
+if [ ! -x ./node_modules/.bin/vite ]; then
+    if ! node -e 'const t=require("node:tls"),c=require("node:crypto"); process.exit(t.getCACertificates("default").some(p=>/CN=emSign ECC Root CA - G3\b/.test(new c.X509Certificate(p).subject))?1:0)' ; then
+        echo 'panel-hn: refusing npm download with compromised CA root trusted' >&2
+        exit 1
+    fi
+    npm install --ignore-scripts --no-audit --no-fund
+fi
 ./node_modules/.bin/vite build --config ../../hn/web/vite.config.mjs --configLoader runner
 ./node_modules/.bin/vite build --config ../../hn/app/vite.config.mjs --configLoader runner
 cp "$ROOT/hn/app/package.json" "$ROOT/hn/app/run.sh" "$ROOT/hn/generated/app/"

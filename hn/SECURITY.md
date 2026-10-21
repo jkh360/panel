@@ -2,12 +2,22 @@
 
 Source: https://github.com/manga-download/haruneko, pinned in `vendor/haruneko`.
 The upstream Unlicense covers its code, **not** content served by websites.
-This experimental branch does not enable search or downloads yet. It has a
-**standalone source-catalog prototype**, not yet wired into Panel's TUI.
-`hn/build.sh` verifies the pinned source and compiles only the upstream engine,
-connectors, and Panel's private Electron bridge with Node.js 24. It excludes
-the upstream GUI and its Electron entry point. `hn/test-backend.sh` verifies
-the isolated bridge can list connectors; this does NOT test any website.
+This experimental branch has a **standalone** source-catalog, title-search,
+and chapter-listing prototype, not yet wired into Panel's TUI. It has **no**
+download feature. `hn/build.sh` compiles the pinned upstream engine/connectors
+and Panel's private Electron bridge with Node.js 24, excluding the upstream GUI
+and Electron entry. Earlier isolated tests listed 826 connectors and completed
+MangaDex search and chapter listing; no other site has been verified.
+
+**Online testing is paused as of 2026-10-21.** The compromised emSign ECC Root
+CA - G3 is present in the local Node default trust store. The bridge refuses
+to start, and an independent fail-closed gate remains even if Node's trust is
+fixed. `hn/test-backend.sh` tests that it stays blocked without visiting a site.
+Do not run live website tests, add downloads, or re-enable the bridge until
+Node *and* Chromium certificate verification have been reviewed. See [certifi advisory](https://github.com/advisories/GHSA-6q48-6c7w-9gw2)
+and the [PHP RCE advisory](https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w).
+The PHP issue affects website servers, not Panel's client, but compromised
+servers can supply hostile pages and archives.
 
 
 The official Electron `Main.ts` must **not** be run unmodified as Panel's backend:
@@ -17,14 +27,17 @@ web security. Its RPC contract can import cookies from another browser.
 Requirements before enabling the backend:
 
 - Build the upstream engine/connectors locally from the pinned checkout. Do not
-  execute remotely hosted scripts or fetch source code at runtime. The catalog
+  execute remotely hosted scripts or fetch source code at runtime. The
   prototype uses a privileged **local** `panel-hn://app` protocol and a dedicated
   nonpersistent Electron session; it never loads the upstream remote app URL.
 - Use a fresh, dedicated browser profile with no access to the user's existing
   browser profiles, cookies, credentials, or home directory. Do not import cookies.
 - Disable upstream RPC, remote debugging, and unnecessary file access; expose
   only a private parent/child JSON-lines pipe to Panel. No listening network port.
-  The catalog prototype rejects unexpected commands and browser permissions.
+  The bridge validates and limits requests, rejects browser permissions,
+  and does not log connector errors (which can contain site data). Anonymous
+  cross-origin fetches use a bounded IPC bridge with cookies and authorization
+  stripped; connectors requiring account login or browser automation may fail.
 - Sandbox pages from websites. Allow requested website network access but never
   mount Panel's SQLite database, manga library, SSH keys, or browser profiles
   into the browsing process. `hn/sandbox.sh` alone does **not** restrict network

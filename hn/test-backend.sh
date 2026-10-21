@@ -1,25 +1,24 @@
 #!/bin/sh
-# Requires built hn/generated, Electron, Xvfb, Node 24 and sandbox tools.
+# Offline fail-closed regression while the 2026-10-20 CA issue is unresolved.
+# This intentionally makes NO website requests. Restore functional tests only
+# after both Node and Chromium certificate trust have been reviewed.
 set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-for tool in electron Xvfb node timeout; do
+for tool in electron Xvfb timeout; do
     command -v "$tool" >/dev/null || { echo "panel-hn: missing $tool" >&2; exit 1; }
 done
 ELECTRON=$(command -v electron)
 XVFB=$(command -v Xvfb)
 STATE=$(mktemp -d)
 trap 'rm -rf -- "$STATE"' EXIT
-printf '%s\n' '{"id":1,"op":"sources"}' '{"id":2,"op":"invalid"}' |
-    timeout 40 "$ROOT/hn/net-sandbox.sh" /bin/sh /app/backend/app/run.sh "$XVFB" "$ELECTRON" \
-    > "$STATE/replies" 2> "$STATE/browser-errors"
-node -e '
-    const fs = require("node:fs");
-    const assert = require("node:assert/strict");
-    const replies = fs.readFileSync(process.argv[1], "utf8").trim().split("\n").map(JSON.parse);
-    assert.equal(replies.length, 2);
-    assert.equal(replies[0].id, 1);
-    assert.ok(replies[0].sources.length > 500, "upstream catalog should be present");
-    assert.ok(replies[0].sources.some(site => site.id === "mangadex"));
-    assert.deepEqual(replies[1], { id: 2, error: "request failed" });
-    console.log(`panel-hn: ${replies[0].sources.length} upstream connectors listed (not site-tested)`);
-' "$STATE/replies"
+if printf '%s\n' '{"id":1,"op":"sources"}' |
+    timeout 15 "$ROOT/hn/net-sandbox.sh" /bin/sh /app/backend/app/run.sh "$XVFB" "$ELECTRON" \
+    > "$STATE/replies" 2> "$STATE/errors"; then
+    echo 'panel-hn: SECURITY FAILURE: backend started during CA pause' >&2
+    exit 1
+fi
+if [ -s "$STATE/replies" ] || ! grep -q 'online backend paused' "$STATE/errors"; then
+    echo 'panel-hn: backend failed for a reason other than the expected CA pause' >&2
+    exit 1
+fi
+printf 'panel-hn: confirmed online backend refuses to start; no site contacted\n'

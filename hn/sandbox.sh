@@ -29,6 +29,7 @@ fi
 set -- --clearenv --die-with-parent --new-session --unshare-ipc --unshare-pid \
     --proc /proc --dev /dev --tmpfs /tmp --tmpfs /home \
     --dir /app --ro-bind "$ASSETS" /app/backend \
+    --ro-bind "$(readlink -f /etc/fonts)" /etc/fonts \
     --ro-bind "$(readlink -f "$(command -v sleep)")" /app/sleep \
     --setenv HOME /tmp/panel-hn \
     --setenv XDG_CONFIG_HOME /tmp/panel-hn/.config \
@@ -37,6 +38,7 @@ set -- --clearenv --die-with-parent --new-session --unshare-ipc --unshare-pid \
     --setenv TMPDIR /tmp \
     --setenv PATH /usr/bin:/bin \
     --setenv LANG C.UTF-8 \
+    --setenv FONTCONFIG_FILE /etc/fonts/fonts.conf \
     --setenv PANEL_HN_NET_ISOLATED "${PANEL_HN_NET_ISOLATED:-0}" \
     "$@"
 # Bind runtime directories only when present. Never bind an entire home or /run.
