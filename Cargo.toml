@@ -1,0 +1,21 @@
+[package]
+name = "panel"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+description = "A minimal, keyboard-driven manga reader for Linux"
+repository = "https://github.com/jkh360/panel"
+rust-version = "1.85"
+
+[dependencies]
+anyhow = "1.0"
+gtk = { package = "gtk4", version = "0.10", features = ["v4_10"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+natord = "1.0"
+rusqlite = { version = "0.37", features = ["bundled"] }
+zip = { version = "5.1", default-features = false, features = ["deflate", "deflate64", "bzip2", "zstd"] }
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1

@@ -1,0 +1,13 @@
+# Ignore everything by default. Explicitly allow the publishable source tree.
+*
+
+!/.gitignore
+!/Cargo.toml
+!/Cargo.lock
+!/LICENSE
+!/ARCHITECTURE.md
+!/flake.nix
+!/flake.lock
+
+!/src/
+!/src/*.rs
