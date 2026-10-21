@@ -21,7 +21,10 @@ Requirements before enabling the backend:
   only a private parent/child IPC channel to Panel. Never listen on a network port.
 - Sandbox pages from websites. Allow requested website network access but never
   mount Panel's SQLite database, manga library, SSH keys, or browser profiles
-  into the browsing process.
+  into the browsing process. `hn/sandbox.sh` is a filesystem/environment
+  isolation probe; it does not yet isolate networking. Before running a browser,
+  also prevent untrusted website pages from reaching local services on loopback
+  or the LAN while allowing intended public websites.
 - Confirm downloaded data are images, bound their size and count, write CBZ
   files atomically, and prevent traversal or overwrite through remote filenames.
 - Run only when a user explicitly opens Search. Keep the reader offline.
