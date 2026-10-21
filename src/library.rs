@@ -230,13 +230,9 @@ impl Library {
                         .rev()
                         .find(|(_, start)| **start <= position.page)
                         .map(|(number, start)| {
-                            format!(
-                                "Chapter {number} · page {} (book page {})",
-                                position.page - start + 1,
-                                position.page + 1
-                            )
+                            format!("Chapter {number} · page {}", position.page - start + 1)
                         })
-                        .unwrap_or_else(|| format!("Book page {}", position.page + 1));
+                        .unwrap_or_else(|| format!("Page {}", position.page + 1));
                     entries.push(Entry::LastRead {
                         path: path.clone(),
                         description: chapter,
