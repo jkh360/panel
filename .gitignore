@@ -2,6 +2,7 @@
 *
 
 !/.gitignore
+!/.gitmodules
 !/Cargo.toml
 !/Cargo.lock
 !/LICENSE
@@ -9,6 +10,12 @@
 !/ARCHITECTURE.md
 !/flake.nix
 !/flake.lock
+
+!/hn/
+!/hn/SECURITY.md
+
+!/vendor/
+!/vendor/haruneko
 
 !/src/
 !/src/*.rs

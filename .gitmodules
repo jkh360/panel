@@ -1,0 +1,3 @@
+[submodule "vendor/haruneko"]
+	path = vendor/haruneko
+	url = https://github.com/manga-download/haruneko.git
