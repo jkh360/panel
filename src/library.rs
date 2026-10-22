@@ -183,6 +183,7 @@ impl Library {
                 books.push(path);
             }
         }
+        directories.retain(|path| !is_sidecar_folder(path, &books));
         directories.sort_by(|a, b| {
             natord::compare_ignore_case(&a.to_string_lossy(), &b.to_string_lossy())
         });
@@ -297,7 +298,9 @@ impl Library {
             let result = (|| -> Result<_, String> {
                 let mut book = CbzDocument::open(&path).map_err(|error| error.to_string())?;
                 let pages = book.page_count();
-                let cover = book.load_cover().map_err(|error| error.to_string())?;
+                let cover = sidecar_cover(&path)
+                    .and_then(|cover| load_sidecar_cover(&cover).ok())
+                    .map_or_else(|| book.load_cover().map_err(|error| error.to_string()), Ok)?;
                 Ok((cover.thumbnail(1200, 1600), pages))
             })();
             let _ = sender.send(Preview { path, result });
@@ -597,19 +600,48 @@ impl Library {
 }
 
 // Heuristics affect presentation only; filenames and files on disk are untouched.
+fn volume_marker(name: &str) -> Option<(usize, u32)> {
+    let bytes = name.as_bytes();
+    for (index, _) in name.char_indices() {
+        if index != 0 && !matches!(bytes[index - 1], b' ' | b'-' | b'_' | b'(') {
+            continue;
+        }
+        let rest = &name[index..];
+        for prefix in ["volume", "vol", "v"] {
+            if !rest
+                .get(..prefix.len())
+                .is_some_and(|part| part.eq_ignore_ascii_case(prefix))
+            {
+                continue;
+            }
+            let suffix = rest[prefix.len()..].trim_start_matches([' ', '.', '_', '-']);
+            let digits = suffix.bytes().take_while(u8::is_ascii_digit).count();
+            if digits == 0
+                || suffix
+                    .as_bytes()
+                    .get(digits)
+                    .is_some_and(u8::is_ascii_alphabetic)
+            {
+                continue;
+            }
+            if let Ok(number) = suffix[..digits].parse() {
+                return Some((index, number));
+            }
+        }
+    }
+    None
+}
+
 fn series_title(path: &Path) -> String {
     let stem = path.file_stem().unwrap_or_default().to_string_lossy();
     let name = stem.as_ref();
-    let cutoff = name
-        .char_indices()
-        .find(|(index, character)| {
-            let rest = &name[*index..];
-            (*character == 'v' || *character == 'V')
-                && (*index == 0 || name.as_bytes()[index - 1].is_ascii_whitespace())
-                && rest[1..].starts_with(|c: char| c.is_ascii_digit())
-                || matches!(character, '(' | '[')
-        })
-        .map_or(name.len(), |(index, _)| index);
+    let marker = volume_marker(name).map(|(index, _)| index);
+    let annotation = name.find(['(', '[']);
+    let cutoff = marker
+        .into_iter()
+        .chain(annotation)
+        .min()
+        .unwrap_or(name.len());
     let title = name[..cutoff].trim().trim_end_matches(['-', '_']).trim();
     if title.is_empty() {
         name.to_owned()
@@ -620,31 +652,109 @@ fn series_title(path: &Path) -> String {
 
 fn volume_title(path: &Path) -> String {
     let stem = path.file_stem().unwrap_or_default().to_string_lossy();
-    let name = stem.as_ref();
-    let volume = name.split_whitespace().find_map(|token| {
-        let digits = token.strip_prefix(['v', 'V'])?;
-        (!digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())).then_some(digits)
-    });
-    match volume {
-        Some(number) => format!("Volume {number}"),
+    match volume_marker(&stem) {
+        Some((_, number)) => format!("Volume {number}"),
         None => "Volume (unspecified)".into(),
     }
 }
 
 fn chapter_number(name: &str) -> Option<u32> {
     let bytes = name.as_bytes();
-    for index in 0..bytes.len().saturating_sub(1) {
-        if (bytes[index] == b'c' || bytes[index] == b'C')
-            && (index == 0 || !bytes[index - 1].is_ascii_alphanumeric())
-            && bytes[index + 1].is_ascii_digit()
+    for index in 0..bytes.len() {
+        if !bytes[index].eq_ignore_ascii_case(&b'c')
+            || (index != 0 && bytes[index - 1].is_ascii_alphanumeric())
         {
-            let end = (index + 1..bytes.len())
-                .find(|&n| !bytes[n].is_ascii_digit())
-                .unwrap_or(bytes.len());
-            return name[index + 1..end].parse().ok();
+            continue;
+        }
+        let rest = &name[index..];
+        let prefix = if rest
+            .get(..7)
+            .is_some_and(|part| part.eq_ignore_ascii_case("chapter"))
+        {
+            7
+        } else if rest
+            .get(..2)
+            .is_some_and(|part| part.eq_ignore_ascii_case("ch"))
+        {
+            2
+        } else {
+            1
+        };
+        let suffix = &rest[prefix..];
+        let suffix = if prefix == 1 {
+            suffix
+        } else {
+            suffix.trim_start_matches([' ', '.', '_', '-', '#'])
+        };
+        let digits = suffix.bytes().take_while(u8::is_ascii_digit).count();
+        if digits != 0
+            && !suffix
+                .as_bytes()
+                .get(digits)
+                .is_some_and(u8::is_ascii_alphabetic)
+        {
+            if let Ok(number) = suffix[..digits].parse() {
+                return Some(number);
+            }
         }
     }
     None
+}
+
+fn sidecar_cover(book: &Path) -> Option<PathBuf> {
+    let volume = volume_marker(&book.file_stem()?.to_string_lossy())?.1;
+    let covers = book.parent()?.join("Covers");
+    let mut images: Vec<_> = fs::read_dir(covers)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| {
+                        ["jpg", "jpeg", "png", "webp"]
+                            .iter()
+                            .any(|supported| ext.eq_ignore_ascii_case(supported))
+                    })
+        })
+        .collect();
+    images.sort();
+    images.into_iter().find(|path| {
+        let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+        let trailing = stem
+            .rfind(['v', 'V'])
+            .and_then(|index| stem[index + 1..].parse::<u32>().ok());
+        volume_marker(&stem).map(|(_, number)| number).or(trailing) == Some(volume)
+    })
+}
+
+fn is_sidecar_folder(path: &Path, books: &[PathBuf]) -> bool {
+    if !path
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("Covers"))
+        || !books.iter().any(|book| sidecar_cover(book).is_some())
+    {
+        return false;
+    }
+    fs::read_dir(path).is_ok_and(|items| {
+        items
+            .flatten()
+            .all(|item| item.file_type().is_ok_and(|kind| kind.is_file()) && !is_cbz(&item.path()))
+    })
+}
+
+fn load_sidecar_cover(path: &Path) -> Result<DynamicImage> {
+    anyhow::ensure!(fs::metadata(path)?.len() <= 8_000_000, "cover is too large");
+    let (width, height) = image::ImageReader::open(path)?
+        .with_guessed_format()?
+        .into_dimensions()?;
+    anyhow::ensure!(
+        width > 0 && height > 0 && width <= 4000 && height <= 4000,
+        "cover dimensions are too large"
+    );
+    Ok(image::open(path)?)
 }
 
 fn configuration_path() -> Option<PathBuf> {
@@ -693,8 +803,9 @@ fn is_cbz(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{chapter_number, series_title, volume_title};
-    use std::path::Path;
+    use super::{chapter_number, is_sidecar_folder, series_title, sidecar_cover, volume_title};
+    use crate::document::CbzDocument;
+    use std::{collections::BTreeSet, env, fs, path::Path, time::SystemTime};
 
     #[test]
     fn groups_single_volume() {
@@ -703,5 +814,88 @@ mod tests {
         assert_eq!(volume_title(book), "Volume 41");
         assert_eq!(chapter_number("Berserk - c358 (v41) - p000.jpg"), Some(358));
         assert_eq!(chapter_number("page-001.jpg"), None);
+    }
+
+    #[test]
+    fn groups_numbered_volumes_and_chapter_directories_without_moving_files() {
+        for number in 1..=17 {
+            let book = format!("Kokou no Hito - Volume_{number:02}.cbz");
+            let path = Path::new(&book);
+            assert_eq!(series_title(path), "Kokou no Hito");
+            assert_eq!(volume_title(path), format!("Volume {number}"));
+        }
+        assert_eq!(chapter_number("Vol.1 Ch.1 - First/000.jpg"), Some(1));
+        assert_eq!(chapter_number("Vol.10 Ch.093 - Snow/001.png"), Some(93));
+        assert_eq!(chapter_number("Vol.17 Ch.170 - End/033.jpg"), Some(170));
+        assert_eq!(chapter_number("Chapter 42/page_0001.webp"), Some(42));
+        assert_eq!(chapter_number("book/chapter-cover.jpg"), None);
+        assert_eq!(chapter_number("book/scanned-page-001.jpg"), None);
+    }
+
+    #[test]
+    fn associates_sidecar_covers_by_volume_without_confusing_one_and_ten() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let root =
+            env::temp_dir().join(format!("panel-cover-test-{}-{unique}", std::process::id()));
+        let covers = root.join("Covers");
+        fs::create_dir_all(&covers).expect("create temporary covers");
+        let one = covers.join("1422v1.jpg");
+        let ten = covers.join("1422v10.jpg");
+        fs::write(&one, []).expect("create mock cover one");
+        fs::write(&ten, []).expect("create mock cover ten");
+        assert_eq!(
+            sidecar_cover(&root.join("Kokou no Hito - Volume_01.cbz")),
+            Some(one)
+        );
+        assert_eq!(
+            sidecar_cover(&root.join("Kokou no Hito - Volume_10.cbz")),
+            Some(ten)
+        );
+        assert_eq!(
+            sidecar_cover(&root.join("Kokou no Hito - Volume_02.cbz")),
+            None
+        );
+        let volumes = [root.join("Kokou no Hito - Volume_01.cbz")];
+        assert!(is_sidecar_folder(&covers, &volumes));
+        fs::write(covers.join("unexpected.cbz"), []).expect("create book in covers");
+        assert!(!is_sidecar_folder(&covers, &volumes));
+        fs::remove_dir_all(root).expect("remove temporary covers");
+    }
+
+    #[test]
+    fn optional_local_collection_has_all_chapters() {
+        let Some(directory) = env::var_os("PANEL_TEST_KOKOU_DIRECTORY") else {
+            return;
+        };
+        let directory = std::path::PathBuf::from(directory);
+        let mut chapters = BTreeSet::new();
+        let mut volumes = BTreeSet::new();
+        let mut books = Vec::new();
+        for entry in fs::read_dir(&directory).expect("list local collection") {
+            let path = entry.expect("read local entry").path();
+            if !super::is_cbz(&path) {
+                continue;
+            }
+            assert_eq!(series_title(&path), "Kokou no Hito");
+            let volume = super::volume_marker(&path.file_stem().unwrap().to_string_lossy())
+                .expect("volume label")
+                .1;
+            assert!(volumes.insert(volume), "volume appears twice");
+            let cover = sidecar_cover(&path).expect("missing volume cover");
+            super::load_sidecar_cover(&cover).expect("decode volume cover");
+            let book = CbzDocument::open(&path).expect("read volume");
+            books.push(path);
+            for page in 0..book.page_count() {
+                if let Some(chapter) = chapter_number(book.page_name(page)) {
+                    chapters.insert(chapter);
+                }
+            }
+        }
+        assert_eq!(volumes, (1..=17).collect());
+        assert_eq!(chapters, (1..=170).collect());
+        assert!(is_sidecar_folder(&directory.join("Covers"), &books));
     }
 }
