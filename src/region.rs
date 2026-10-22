@@ -314,52 +314,45 @@ fn order_group(group: Vec<Region>, ordered: &mut Vec<Region>) {
 }
 
 fn divide(group: &[Region], horizontal: bool) -> Option<(Vec<Region>, Vec<Region>)> {
-    let mut best: Option<(u32, usize, u32)> = None;
-    for panel in group {
-        let cut = if horizontal {
-            panel.bottom()
+    let start = |region: Region| if horizontal { region.y } else { region.x };
+    let end = |region: Region| {
+        if horizontal {
+            region.bottom()
         } else {
-            panel.right()
-        };
-        let mut before = 0;
-        let mut after = 0;
-        let mut nearest = u32::MAX;
-        let mut crossed = false;
-        for candidate in group {
-            let (start, end) = if horizontal {
-                (candidate.y, candidate.bottom())
-            } else {
-                (candidate.x, candidate.right())
-            };
-            if end <= cut {
-                before += 1;
-            } else if start >= cut {
-                after += 1;
-                nearest = nearest.min(start);
-            } else {
-                crossed = true;
-                break;
-            }
+            region.right()
         }
-        if crossed || before == 0 || after == 0 {
+    };
+    let extent = group.iter().map(|&r| end(r)).max()? - group.iter().map(|&r| start(r)).min()?;
+    // Detector boxes often bleed a few pixels into adjacent panels. Small
+    // overlaps should not erase an otherwise page-wide gutter.
+    let tolerance = (extent / 50).clamp(1, 32);
+    let mut sorted = group.to_vec();
+    sorted.sort_by_key(|&r| {
+        (
+            u64::from(start(r)) + u64::from(end(r)),
+            start(r),
+            end(r),
+            r.x,
+            r.y,
+        )
+    });
+    let mut best: Option<(i64, usize, usize)> = None;
+    for split in 1..sorted.len() {
+        let before_end = sorted[..split].iter().map(|&r| end(r)).max().unwrap_or(0);
+        let after_start = sorted[split..].iter().map(|&r| start(r)).min().unwrap_or(0);
+        let gap = i64::from(after_start) - i64::from(before_end);
+        if gap < -i64::from(tolerance) {
             continue;
         }
-        // Prefer a clear gutter, then a balanced split. A zero-width gutter
-        // still counts when panel rectangles meet exactly at their edges.
-        let candidate = (nearest - cut, before.min(after), cut);
+        // Prefer a clear gutter, then a balanced split. For equal scores,
+        // choose the later cut; recursion orders the subgroups.
+        let candidate = (gap, split.min(sorted.len() - split), split);
         if best.is_none_or(|previous| candidate > previous) {
             best = Some(candidate);
         }
     }
-    let cut = best?.2;
-    let (before, after) = group.iter().copied().partition(|r| {
-        if horizontal {
-            r.bottom() <= cut
-        } else {
-            r.right() <= cut
-        }
-    });
-    Some((before, after))
+    let split = best?.2;
+    Some((sorted[..split].to_vec(), sorted[split..].to_vec()))
 }
 
 pub fn padded(region: Region, page_width: u32, page_height: u32) -> Region {
@@ -401,6 +394,28 @@ mod tests {
         assert_eq!(regions, [top_right, bottom_right, left]);
         order_rtl(&mut regions);
         assert_eq!(regions, [top_right, bottom_right, left]);
+    }
+
+    #[test]
+    fn tiny_vertical_bleed_does_not_prevent_an_upper_tier() {
+        let left = panel(0, 0, 110, 200);
+        let top_right = panel(120, 10, 80, 80);
+        let bottom_right = panel(120, 100, 80, 95);
+        let footer = panel(0, 198, 200, 70);
+        let mut regions = [top_right, left, bottom_right, footer];
+        order_rtl(&mut regions);
+        assert_eq!(regions, [top_right, bottom_right, left, footer]);
+    }
+
+    #[test]
+    fn tiny_horizontal_bleed_does_not_split_the_right_stack() {
+        let left = panel(0, 0, 480, 520);
+        let top_right = panel(470, 0, 380, 340);
+        let bottom_right = panel(475, 350, 375, 170);
+        let footer = panel(0, 540, 850, 180);
+        let mut regions = [top_right, left, bottom_right, footer];
+        order_rtl(&mut regions);
+        assert_eq!(regions, [top_right, bottom_right, left, footer]);
     }
 
     #[test]

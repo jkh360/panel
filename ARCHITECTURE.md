@@ -27,9 +27,10 @@ texture remains unchanged. Esc closes GTK and restores the previous selector
 position; q exits Panel. Closing cancels detection without blocking GTK. On
 Linux, detector children receive a parent-death signal to prevent orphans.
 Panel ordering recursively groups regions across
-page-wide horizontal gutters (top first), then vertical gutters (right first).
-Irregular overlapping layouts use a deterministic fallback. Cached regions
-are reordered when loaded, without rerunning the external detector.
+page-wide horizontal gutters (top first), then vertical gutters (right first),
+allowing small detector-box overlaps across otherwise clear gutters. Irregular
+layouts use a deterministic fallback. Cached regions and late external-cache
+overrides are reordered when displayed, without rerunning the detector.
 
 ## Detector boundary
 
