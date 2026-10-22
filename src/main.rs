@@ -576,24 +576,24 @@ fn load_or_detect(
 ) -> DetectionResult {
     match detection_cache::load_external(connection, path, page, image.width(), image.height()) {
         Ok(Some(imported)) if !imported.regions.is_empty() => {
-            return DetectionResult {
+            return ordered(DetectionResult {
                 regions: imported.regions,
                 source: imported.source,
                 fallback_reason: None,
                 cached: true,
-            };
+            });
         }
         Ok(_) => {}
         Err(error) => eprintln!("panel: failed to read external regions: {error:#}"),
     }
     match detection_cache::load(connection, path, page, image.width(), image.height()) {
         Ok(Some(cached)) if !cached.regions.is_empty() => {
-            return DetectionResult {
+            return ordered(DetectionResult {
                 regions: cached.regions,
                 source: cached.source,
                 fallback_reason: cached.fallback_reason,
                 cached: true,
-            };
+            });
         }
         Ok(_) => {}
         Err(error) => eprintln!("panel: failed to read detection cache: {error:#}"),
@@ -614,7 +614,12 @@ fn load_or_detect(
     ) {
         eprintln!("panel: failed to save detection cache: {error:#}");
     }
-    result
+    ordered(result)
+}
+
+fn ordered(mut detection: DetectionResult) -> DetectionResult {
+    region::order_rtl(&mut detection.regions);
+    detection
 }
 
 fn detect_regions(image: &RgbaImage) -> DetectionResult {
@@ -737,8 +742,14 @@ fn install_css() {
 
 #[cfg(test)]
 mod tests {
-    use super::restored_region;
-    use crate::progress::Position;
+    use super::{load_or_detect, restored_region};
+    use crate::{
+        detection_cache,
+        progress::{Position, ProgressStore},
+        region::Region,
+    };
+    use image::RgbaImage;
+    use std::{fs, time::SystemTime};
 
     #[test]
     fn restores_saved_panel_unless_a_chapter_was_chosen() {
@@ -749,5 +760,52 @@ mod tests {
         assert_eq!(restored_region(saved, None, 5), 3);
         assert_eq!(restored_region(saved, None, 2), 1);
         assert_eq!(restored_region(saved, Some(12), 5), 0);
+    }
+
+    #[test]
+    fn previously_cached_external_panels_are_reordered_without_reanalysis() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let book = std::env::temp_dir().join(format!(
+            "panel-order-cache-{}-{unique}.cbz",
+            std::process::id()
+        ));
+        fs::write(&book, []).unwrap();
+        let store = ProgressStore::in_memory().unwrap();
+        let left = Region {
+            x: 0,
+            y: 0,
+            width: 90,
+            height: 210,
+        };
+        let top = Region {
+            x: 110,
+            y: 0,
+            width: 90,
+            height: 90,
+        };
+        let bottom = Region {
+            x: 110,
+            y: 110,
+            width: 90,
+            height: 90,
+        };
+        detection_cache::save_external(
+            store.connection(),
+            &book,
+            0,
+            200,
+            210,
+            "magi",
+            &[left, top, bottom],
+        )
+        .unwrap();
+        let detection = load_or_detect(store.connection(), &book, 0, &RgbaImage::new(200, 210));
+        assert_eq!(detection.regions, [top, bottom, left]);
+        assert_eq!(detection.source, "magi");
+        assert!(detection.cached);
+        fs::remove_file(book).unwrap();
     }
 }
