@@ -10,11 +10,15 @@ and Electron entry. Earlier isolated tests listed 826 connectors and completed
 MangaDex search and chapter listing; no other site has been verified.
 
 **Online testing is paused as of 2026-10-21.** The compromised emSign ECC Root
-CA - G3 is present in the local Node default trust store. The bridge refuses
-to start, and an independent fail-closed gate remains even if Node's trust is
-fixed. `hn/test-backend.sh` tests that it stays blocked without visiting a site.
-Do not run live website tests, add downloads, or re-enable the bridge until
-Node *and* Chromium certificate verification have been reviewed. See [certifi advisory](https://github.com/advisories/GHSA-6q48-6c7w-9gw2)
+CA - G3 remains in the host Node default trust store (rechecked 2026-10-22).
+The bridge removes it from its own Node trust before any networking, and a
+separate Chromium certificate policy rejects chains identifying that issuer
+without overriding other certificate failures. These policies have **offline
+unit tests only**; Chromium's real-chain behavior has not been verified.
+An independent fail-closed gate still prevents the bridge from starting.
+`hn/test-backend.sh` verifies this without visiting a site. Do not run live
+website tests, add downloads, or remove the gate until both trust paths are
+verified end-to-end. See [certifi advisory](https://github.com/advisories/GHSA-6q48-6c7w-9gw2)
 and the [PHP RCE advisory](https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w).
 The PHP issue affects website servers, not Panel's client, but compromised
 servers can supply hostile pages and archives.

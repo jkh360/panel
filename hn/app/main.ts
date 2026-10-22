@@ -1,29 +1,27 @@
 import { app, BrowserWindow, ipcMain, net, protocol, session } from 'electron';
 import fs from 'node:fs';
-import { X509Certificate } from 'node:crypto';
-import { getCACertificates } from 'node:tls';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import readline from 'node:readline';
 import { IPC } from '../../vendor/haruneko/app/electron/src/ipc/InterProcessCommunication';
 import { FetchProvider } from '../../vendor/haruneko/app/electron/src/ipc/FetchProvider';
 import { registerRemoteWindows } from './remote-windows';
+import { certificateDecision } from './ca-policy.mjs';
+import { removeCompromisedNodeRoot } from './node-ca.mjs';
 
 if (process.env.PANEL_HN_NET_ISOLATED !== '1') {
     console.error('panel-hn: refusing to run outside hn/net-sandbox.sh');
     process.exit(1);
 }
-// 2026-10-20: eight compromised eMudhra intermediate keys chain to this root.
-// Node's default trust store on the development host still contains it. Until
-// BOTH Node and Chromium trust are reviewed, block the entire online backend.
-const affectedRoot = getCACertificates('default').some(pem =>
-    /CN=emSign ECC Root CA - G3\b/.test(new X509Certificate(pem).subject));
-if (affectedRoot) {
-    console.error('panel-hn: online backend paused: compromised CA root is trusted');
+// 2026-10-20: eight compromised eMudhra intermediates chain to the G3 root.
+// Drop it from Node's trust before any networking, but do NOT enable websites:
+// Electron/Chromium's independent verifier still needs real-chain testing.
+try {
+    removeCompromisedNodeRoot();
+} catch {
+    console.error('panel-hn: online backend paused: could not constrain CA trust');
     process.exit(1);
 }
-// Node remediation alone is insufficient: Chromium has a separate verifier.
-// Remove this fail-closed gate only after reviewing Chromium trust as well.
 console.error('panel-hn: online backend paused pending Chromium CA review');
 process.exit(1);
 
@@ -40,6 +38,10 @@ async function run(): Promise<void> {
     const assets = path.resolve(app.getAppPath(), '../web');
     const root = fs.realpathSync(assets);
     const backendSession = session.fromPartition('panel-hn-ephemeral');
+    for (const browserSession of [session.defaultSession, backendSession]) {
+        browserSession.setCertificateVerifyProc((request, callback) =>
+            callback(certificateDecision(request)));
+    }
     backendSession.protocol.handle('panel-hn', async request => {
         try {
             const uri = new URL(request.url);

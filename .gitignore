@@ -26,6 +26,10 @@
 !/hn/web/no-frontend.ts
 !/hn/app/
 !/hn/app/main.ts
+!/hn/app/ca-policy.mjs
+!/hn/app/ca-policy.test.mjs
+!/hn/app/node-ca.mjs
+!/hn/app/node-ca.test.mjs
 !/hn/app/remote-windows.ts
 !/hn/app/preload.ts
 !/hn/app/package.json
