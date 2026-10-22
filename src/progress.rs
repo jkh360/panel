@@ -31,6 +31,13 @@ impl ProgressStore {
         Ok(Self { connection })
     }
 
+    #[cfg(test)]
+    pub(crate) fn in_memory() -> Result<Self> {
+        let connection = Connection::open_in_memory()?;
+        initialize(&connection)?;
+        Ok(Self { connection })
+    }
+
     pub fn connection(&self) -> &Connection {
         &self.connection
     }

@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     env, fs,
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
@@ -10,7 +11,9 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use image::RgbaImage;
 
-use crate::{detection_cache, document::CbzDocument, progress::ProgressStore, region::Region};
+use crate::{
+    detection_cache, document::CbzDocument, library, progress::ProgressStore, region::Region,
+};
 
 pub enum CommandMessage {
     Prioritize(usize),
@@ -19,6 +22,7 @@ pub enum CommandMessage {
 
 #[derive(Debug)]
 pub struct ResultMessage {
+    pub book: PathBuf,
     pub page: usize,
     pub regions: Vec<Region>,
     pub source: String,
@@ -42,6 +46,35 @@ pub fn spawn(
     })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Task {
+    book: usize,
+    page: usize,
+}
+
+fn schedule(counts: &[usize], start: usize) -> VecDeque<Task> {
+    let mut queue = VecDeque::new();
+    let Some(&current) = counts.first() else {
+        return queue;
+    };
+    // Never consume pages behind the reading position until all forward
+    // volumes have been analyzed. The visible volume always takes priority.
+    queue.extend((start.min(current)..current).map(|page| Task { book: 0, page }));
+    for (book, &count) in counts.iter().enumerate().skip(1) {
+        queue.extend((0..count).map(|page| Task { book, page }));
+    }
+    queue.extend((0..start.min(current)).map(|page| Task { book: 0, page }));
+    queue
+}
+
+fn prioritize(queue: &mut VecDeque<Task>, page: usize) {
+    let target = Task { book: 0, page };
+    if queue.contains(&target) {
+        queue.retain(|task| *task != target);
+        queue.push_front(target);
+    }
+}
+
 fn run(
     book: &Path,
     start: usize,
@@ -49,41 +82,61 @@ fn run(
     results: &SyncSender<Result<ResultMessage, String>>,
 ) -> Result<()> {
     let mut process = Process::start()?;
-    let mut document = CbzDocument::open(book)?;
     let store = ProgressStore::open()?;
-    let count = document.page_count();
-    let mut queue: Vec<usize> = (start..count).chain(0..start).collect();
-    let mut done = vec![false; count];
+    run_with(book, start, requests, results, &mut process, &store)
+}
 
-    while let Some(page) = queue.first().copied() {
+fn run_with(
+    book: &Path,
+    start: usize,
+    requests: Receiver<CommandMessage>,
+    results: &SyncSender<Result<ResultMessage, String>>,
+    process: &mut Process,
+    store: &ProgressStore,
+) -> Result<()> {
+    let mut documents = vec![(book.to_path_buf(), CbzDocument::open(book)?)];
+    for path in library::later_volumes(book) {
+        match CbzDocument::open(&path) {
+            Ok(document) => documents.push((path, document)),
+            Err(error) => {
+                let _ = results.send(Err(format!("skipping unreadable volume: {error}")));
+            }
+        }
+    }
+    let counts: Vec<_> = documents.iter().map(|(_, doc)| doc.page_count()).collect();
+    let mut queue = schedule(&counts, start);
+
+    while !queue.is_empty() {
         while let Ok(message) = requests.try_recv() {
             match message {
-                CommandMessage::Prioritize(page) if page < count && !done[page] => {
-                    queue.retain(|candidate| *candidate != page);
-                    queue.insert(0, page);
+                CommandMessage::Prioritize(page) if page < counts[0] => {
+                    prioritize(&mut queue, page);
                 }
                 CommandMessage::Prioritize(_) => {}
                 CommandMessage::Stop => return Ok(()),
             }
         }
-        queue.remove(0);
-
-        let image = document.load_page(page)?;
+        let task = queue.pop_front().expect("nonempty task queue");
+        let (path, document) = &mut documents[task.book];
+        let image = document.load_page(task.page)?;
         if detection_cache::load_external(
             store.connection(),
-            book,
-            page,
+            path,
+            task.page,
             image.width(),
             image.height(),
         )?
         .is_some()
         {
-            done[page] = true;
             continue;
         }
 
-        match process.detect(page, &image) {
+        match process.detect(task.page, &image, path) {
             Ok(mut result) => {
+                ensure!(
+                    result.page == task.page,
+                    "detector returned a different page index"
+                );
                 result.regions = sanitize(result.regions, image.width(), image.height());
                 if result.regions.is_empty() {
                     result.regions.push(Region {
@@ -96,14 +149,13 @@ fn run(
                 }
                 detection_cache::save_external(
                     store.connection(),
-                    book,
-                    page,
+                    path,
+                    task.page,
                     image.width(),
                     image.height(),
                     &result.source,
                     &result.regions,
                 )?;
-                done[page] = true;
                 let _ = results.send(Ok(result));
             }
             Err(error) => {
@@ -125,6 +177,10 @@ impl Process {
     fn start() -> Result<Self> {
         let command =
             env::var_os("PANEL_DETECTOR_COMMAND").context("PANEL_DETECTOR_COMMAND is not set")?;
+        Self::start_with_command(command)
+    }
+
+    fn start_with_command(command: impl AsRef<std::ffi::OsStr>) -> Result<Self> {
         let mut child = Command::new(command)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -150,7 +206,7 @@ impl Process {
         })
     }
 
-    fn detect(&mut self, page: usize, image: &RgbaImage) -> Result<ResultMessage> {
+    fn detect(&mut self, page: usize, image: &RgbaImage, book: &Path) -> Result<ResultMessage> {
         let path = self.temporary.join(format!("page-{page:04}.png"));
         image.save(&path)?;
         writeln!(self.input, "{page}\t{}", path.display())?;
@@ -159,7 +215,7 @@ impl Process {
         self.output.read_line(&mut line)?;
         let _ = fs::remove_file(path);
         ensure!(!line.is_empty(), "detector exited unexpectedly");
-        parse_response(&line)
+        parse_response(&line, book)
     }
 }
 
@@ -171,7 +227,7 @@ impl Drop for Process {
     }
 }
 
-fn parse_response(line: &str) -> Result<ResultMessage> {
+fn parse_response(line: &str, book: &Path) -> Result<ResultMessage> {
     if line.contains("\"error\"") {
         bail!("external detector failed: {line}")
     }
@@ -192,6 +248,7 @@ fn parse_response(line: &str) -> Result<ResultMessage> {
         .collect::<std::result::Result<_, _>>()?;
     ensure!(values.len() % 4 == 0, "invalid region array");
     Ok(ResultMessage {
+        book: book.to_path_buf(),
         page,
         source,
         seconds,
@@ -265,17 +322,131 @@ fn sanitize(regions: Vec<Region>, width: u32, height: u32) -> Vec<Region> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_response;
+    use super::{Process, Task, parse_response, prioritize, run_with, schedule};
+    use crate::{detection_cache, progress::ProgressStore};
+    use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
+    use std::{
+        fs,
+        io::{Cursor, Write},
+        os::unix::fs::PermissionsExt,
+        path::Path,
+        sync::mpsc,
+        time::SystemTime,
+    };
 
     #[test]
     fn parses_worker_response() {
         let result = parse_response(
             r#"{"page":3,"source":"example","regions":[[1,2,30,40]],"seconds":1.25}"#,
+            Path::new("example.cbz"),
         )
         .unwrap();
         assert_eq!(result.page, 3);
+        assert_eq!(result.book, Path::new("example.cbz"));
         assert_eq!(result.source, "example");
         assert_eq!(result.regions[0].width, 30);
         assert_eq!(result.seconds, Some(1.25));
+    }
+
+    #[test]
+    fn schedules_reading_position_then_forward_volumes_then_earlier_pages() {
+        let tasks: Vec<_> = schedule(&[5, 2, 1], 3).into_iter().collect();
+        assert_eq!(
+            tasks,
+            [
+                Task { book: 0, page: 3 },
+                Task { book: 0, page: 4 },
+                Task { book: 1, page: 0 },
+                Task { book: 1, page: 1 },
+                Task { book: 2, page: 0 },
+                Task { book: 0, page: 0 },
+                Task { book: 0, page: 1 },
+                Task { book: 0, page: 2 },
+            ]
+        );
+    }
+
+    #[test]
+    fn requested_current_volume_page_jumps_ahead_without_duplicating_work() {
+        let mut queue = schedule(&[5, 2], 3);
+        prioritize(&mut queue, 1);
+        assert_eq!(queue.front(), Some(&Task { book: 0, page: 1 }));
+        assert_eq!(
+            queue
+                .iter()
+                .filter(|task| task.book == 0 && task.page == 1)
+                .count(),
+            1
+        );
+        queue.pop_front();
+        prioritize(&mut queue, 1);
+        assert!(!queue.contains(&Task { book: 0, page: 1 }));
+    }
+
+    #[test]
+    fn mock_worker_caches_forward_volumes_without_confusing_identical_page_numbers() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "panel-detector-test-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let script = root.join("worker.sh");
+        fs::write(
+            &script,
+            b"#!/bin/sh\nprintf '{\"ready\":true}\\n'\nwhile read -r page image; do\n    printf '{\"page\":%s,\"source\":\"mock\",\"regions\":[[0,0,4,4]]}\\n' \"$page\"\ndone\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let image =
+            DynamicImage::ImageRgba8(RgbaImage::from_pixel(4, 4, Rgba([255, 255, 255, 255])));
+        let mut png = Cursor::new(Vec::new());
+        image.write_to(&mut png, ImageFormat::Png).unwrap();
+        let books = [
+            root.join("Climber - Volume_01.cbz"),
+            root.join("Climber - Volume_02.cbz"),
+        ];
+        for (index, path) in books.iter().enumerate() {
+            let file = fs::File::create(path).unwrap();
+            let mut archive = zip::ZipWriter::new(file);
+            for page in 0..(2 - index) {
+                archive
+                    .start_file(
+                        format!("Ch.1/{page:03}.png"),
+                        zip::write::SimpleFileOptions::default(),
+                    )
+                    .unwrap();
+                archive.write_all(png.get_ref()).unwrap();
+            }
+            archive.finish().unwrap();
+        }
+        let store = ProgressStore::in_memory().unwrap();
+        let mut process = Process::start_with_command(&script).unwrap();
+        let (_requests_tx, requests) = mpsc::channel();
+        let (results_tx, results_rx) = mpsc::sync_channel(8);
+        run_with(&books[0], 1, requests, &results_tx, &mut process, &store).unwrap();
+        let results: Vec<_> = results_rx
+            .try_iter()
+            .map(|result| result.unwrap())
+            .collect();
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| (&result.book, result.page))
+                .collect::<Vec<_>>(),
+            [(&books[0], 1), (&books[1], 0), (&books[0], 0)]
+        );
+        for (book, page) in [(&books[0], 1), (&books[1], 0), (&books[0], 0)] {
+            assert!(
+                detection_cache::load_external(store.connection(), book, page, 4, 4)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        drop(process);
+        fs::remove_dir_all(root).unwrap();
     }
 }

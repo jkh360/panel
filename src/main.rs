@@ -392,11 +392,19 @@ fn build_reader(
                 match result {
                     Ok(result) => {
                         eprintln!(
-                            "panel: detector page {} completed in {:.2}s",
+                            "panel: detector {} page {} completed in {:.2}s",
+                            result
+                                .book
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy(),
                             result.page + 1,
                             result.seconds.unwrap_or_default()
                         );
                         let mut reader = reader.borrow_mut();
+                        if result.book != reader.path {
+                            continue;
+                        }
                         if reader.position.page == result.page {
                             reader.page = Page {
                                 texture: reader.page.texture.clone(),

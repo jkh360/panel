@@ -19,8 +19,11 @@ scraper, daemon, embedded browser, or runtime plugin framework.
 GTK owns rendering and input on its main thread. A bounded native worker handles
 archive reads, image decoding, and built-in analysis. If configured, an isolated
 persistent detector process runs behind a second Rust worker. Navigation can
-reprioritize its queue, and completed results replace the visible page regions
-without replacing its decoded texture.
+reprioritize its queue. It processes the current page, remaining pages ahead
+in the current volume, then later volumes of the same manga; earlier pages in
+the current volume come last. Results are cached against each CBZ separately.
+Only detections for the open book can replace visible regions; its decoded
+texture remains unchanged.
 
 ## Detector boundary
 
@@ -39,7 +42,8 @@ silently reused. External regions take priority over built-in results.
 ## Performance rules
 
 - Never unpack a complete book.
-- Decode only requested pages.
+- Decode reader pages on demand; external detection may additionally decode
+  pages queued ahead, but never unpack an entire book.
 - Keep blocking work off the GTK thread.
 - Analyze reduced-resolution images where possible.
 - Keep region coordinates integral and relative to the source image.
