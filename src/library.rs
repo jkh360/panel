@@ -658,6 +658,38 @@ fn volume_title(path: &Path) -> String {
     }
 }
 
+pub(crate) fn later_volumes(book: &Path) -> Vec<PathBuf> {
+    let parent = book
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let Some(current) = book
+        .file_stem()
+        .and_then(|stem| volume_marker(&stem.to_string_lossy()))
+    else {
+        return Vec::new();
+    };
+    let title = series_title(book);
+    let Ok(entries) = fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    let mut later: Vec<_> = entries
+        .filter_map(|entry| entry.ok().map(|item| item.path()))
+        .filter(|path| is_cbz(path) && series_title(path).eq_ignore_ascii_case(&title))
+        .filter_map(|path| {
+            let stem = path.file_stem()?.to_string_lossy();
+            let (_, number) = volume_marker(&stem)?;
+            (number > current.1).then_some((number, path))
+        })
+        .collect();
+    later.sort_by(|(a_number, a_path), (b_number, b_path)| {
+        a_number.cmp(b_number).then_with(|| {
+            natord::compare_ignore_case(&a_path.to_string_lossy(), &b_path.to_string_lossy())
+        })
+    });
+    later.into_iter().map(|(_, path)| path).collect()
+}
+
 fn chapter_number(name: &str) -> Option<u32> {
     let bytes = name.as_bytes();
     for index in 0..bytes.len() {
@@ -803,7 +835,9 @@ fn is_cbz(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{chapter_number, is_sidecar_folder, series_title, sidecar_cover, volume_title};
+    use super::{
+        chapter_number, is_sidecar_folder, later_volumes, series_title, sidecar_cover, volume_title,
+    };
     use crate::document::CbzDocument;
     use std::{collections::BTreeSet, env, fs, path::Path, time::SystemTime};
 
@@ -866,6 +900,33 @@ mod tests {
     }
 
     #[test]
+    fn later_volumes_only_follow_the_same_series_in_numeric_order() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let root = env::temp_dir().join(format!("panel-volumes-{}-{unique}", std::process::id()));
+        fs::create_dir(&root).expect("create volumes directory");
+        for name in [
+            "Climber - Volume_01.cbz",
+            "Climber - Volume_02.cbz",
+            "Climber - Volume_10.cbz",
+            "Climber - Volume_17.cbz",
+            "Other - Volume_03.cbz",
+        ] {
+            fs::write(root.join(name), []).expect("create mock archive");
+        }
+        assert_eq!(
+            later_volumes(&root.join("Climber - Volume_02.cbz")),
+            [
+                root.join("Climber - Volume_10.cbz"),
+                root.join("Climber - Volume_17.cbz")
+            ]
+        );
+        fs::remove_dir_all(root).expect("remove volumes directory");
+    }
+
+    #[test]
     fn optional_local_collection_has_all_chapters() {
         let Some(directory) = env::var_os("PANEL_TEST_KOKOU_DIRECTORY") else {
             return;
@@ -897,5 +958,10 @@ mod tests {
         assert_eq!(volumes, (1..=17).collect());
         assert_eq!(chapters, (1..=170).collect());
         assert!(is_sidecar_folder(&directory.join("Covers"), &books));
+        assert_eq!(
+            later_volumes(&directory.join("Kokou no Hito - Volume_01.cbz")).len(),
+            16
+        );
+        assert!(later_volumes(&directory.join("Kokou no Hito - Volume_17.cbz")).is_empty());
     }
 }
