@@ -35,6 +35,23 @@ const YELLOW: Color = Color::Rgb(250, 189, 47);
 pub struct Selection {
     pub path: PathBuf,
     pub page: Option<usize>,
+    location: Option<Location>,
+}
+
+impl Selection {
+    pub fn direct(path: PathBuf) -> Self {
+        Self {
+            path,
+            page: None,
+            location: None,
+        }
+    }
+}
+
+struct Location {
+    directory: PathBuf,
+    level: Level,
+    selected: usize,
 }
 
 #[derive(Clone)]
@@ -129,7 +146,7 @@ struct Library {
     progress: Option<usize>,
 }
 
-pub fn select() -> Result<Option<Selection>> {
+pub fn select(previous: Option<&Selection>) -> Result<Option<Selection>> {
     anyhow::ensure!(
         io::stdin().is_terminal() && io::stdout().is_terminal(),
         "panel needs an interactive terminal when started without a book"
@@ -138,6 +155,7 @@ pub fn select() -> Result<Option<Selection>> {
     let directory = default_directory()
         .filter(|path| path.is_dir())
         .unwrap_or(home);
+    let (directory, level, selected) = resume_location(previous, directory);
     let (sender, results) = mpsc::channel();
     let mut terminal = ratatui::init();
     let mut picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::from_fontsize((10, 20)));
@@ -146,9 +164,9 @@ pub fn select() -> Result<Option<Selection>> {
     }
     let mut library = Library {
         directory,
-        level: Level::Directory,
+        level,
         entries: Vec::new(),
-        selected: 0,
+        selected,
         preview: None,
         preview_target: None,
         cover_cache: HashMap::new(),
@@ -162,6 +180,36 @@ pub fn select() -> Result<Option<Selection>> {
     let outcome = library.refresh().and_then(|_| library.run(&mut terminal));
     ratatui::restore();
     outcome
+}
+
+fn resume_location(previous: Option<&Selection>, default: PathBuf) -> (PathBuf, Level, usize) {
+    match previous {
+        Some(Selection {
+            location: Some(location),
+            ..
+        }) if location.directory.is_dir() => (
+            location.directory.clone(),
+            location.level.clone(),
+            location.selected,
+        ),
+        Some(selection) if selection.location.is_none() => {
+            let parent = selection
+                .path
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            if parent.is_dir() {
+                (
+                    parent.to_path_buf(),
+                    Level::Volume(selection.path.clone()),
+                    0,
+                )
+            } else {
+                (default, Level::Directory, 0)
+            }
+        }
+        _ => (default, Level::Directory, 0),
+    }
 }
 
 impl Library {
@@ -204,39 +252,36 @@ impl Library {
                 entries.extend(series.into_iter().map(Entry::Series));
                 entries
             }
-            Level::Series(name) => books
-                .into_iter()
-                .filter(|path| series_title(path).eq_ignore_ascii_case(name))
-                .map(|path| Entry::Volume {
-                    label: volume_title(&path),
-                    path,
-                })
-                .collect(),
+            Level::Series(name) => {
+                let volumes: Vec<_> = books
+                    .into_iter()
+                    .filter(|path| series_title(path).eq_ignore_ascii_case(name))
+                    .collect();
+                let last = latest_volume(&volumes);
+                let mut entries: Vec<_> = volumes
+                    .into_iter()
+                    .map(|path| Entry::Volume {
+                        label: volume_title(&path),
+                        path,
+                    })
+                    .collect();
+                if let Some(last) = last {
+                    entries.insert(0, last);
+                }
+                entries
+            }
             Level::Volume(path) => {
                 let book = CbzDocument::open(path)?;
                 let saved = ProgressStore::open()
                     .ok()
                     .and_then(|store| store.load(path).ok().flatten())
                     .filter(|position| position.page < book.page_count());
-                let mut chapters = BTreeMap::new();
-                for page in 0..book.page_count() {
-                    if let Some(number) = chapter_number(book.page_name(page)) {
-                        chapters.entry(number).or_insert(page);
-                    }
-                }
+                let chapters = chapter_starts(&book);
                 let mut entries = Vec::new();
                 if let Some(position) = saved {
-                    let chapter = chapters
-                        .iter()
-                        .rev()
-                        .find(|(_, start)| **start <= position.page)
-                        .map(|(number, start)| {
-                            format!("Chapter {number} · page {}", position.page - start + 1)
-                        })
-                        .unwrap_or_else(|| format!("Page {}", position.page + 1));
                     entries.push(Entry::LastRead {
                         path: path.clone(),
-                        description: chapter,
+                        description: chapter_description(&chapters, position.page),
                     });
                 }
                 if chapters.is_empty() {
@@ -393,22 +438,31 @@ impl Library {
                                 self.refresh()?;
                             }
                             Entry::LastRead { path, .. } => {
-                                return Ok(Some(Selection { path, page: None }));
+                                return Ok(Some(self.select_book(path, None)));
                             }
                             Entry::Chapter { path, page, .. } => {
-                                return Ok(Some(Selection {
-                                    path,
-                                    page: Some(page),
-                                }));
+                                return Ok(Some(self.select_book(path, Some(page))));
                             }
                             Entry::Read { path } => {
-                                return Ok(Some(Selection { path, page: None }));
+                                return Ok(Some(self.select_book(path, None)));
                             }
                         }
                     }
                 }
                 _ => {}
             }
+        }
+    }
+
+    fn select_book(&self, path: PathBuf, page: Option<usize>) -> Selection {
+        Selection {
+            path,
+            page,
+            location: Some(Location {
+                directory: self.directory.clone(),
+                level: self.level.clone(),
+                selected: self.selected,
+            }),
         }
     }
 
@@ -650,6 +704,43 @@ fn series_title(path: &Path) -> String {
     }
 }
 
+fn chapter_starts(book: &CbzDocument) -> BTreeMap<u32, usize> {
+    let mut chapters = BTreeMap::new();
+    for page in 0..book.page_count() {
+        if let Some(number) = chapter_number(book.page_name(page)) {
+            chapters.entry(number).or_insert(page);
+        }
+    }
+    chapters
+}
+
+fn chapter_description(chapters: &BTreeMap<u32, usize>, page: usize) -> String {
+    chapters
+        .iter()
+        .rev()
+        .find(|(_, start)| **start <= page)
+        .map(|(number, start)| format!("Chapter {number} · page {}", page - start + 1))
+        .unwrap_or_else(|| format!("Page {}", page + 1))
+}
+
+fn latest_volume(volumes: &[PathBuf]) -> Option<Entry> {
+    latest_volume_with_store(volumes, &ProgressStore::open().ok()?)
+}
+
+fn latest_volume_with_store(volumes: &[PathBuf], store: &ProgressStore) -> Option<Entry> {
+    let (path, position) = store.most_recent(volumes).ok()??;
+    let book = CbzDocument::open(&path).ok()?;
+    if position.page >= book.page_count() {
+        return None;
+    }
+    let description = format!(
+        "{} · {}",
+        volume_title(&path),
+        chapter_description(&chapter_starts(&book), position.page)
+    );
+    Some(Entry::LastRead { path, description })
+}
+
 fn volume_title(path: &Path) -> String {
     let stem = path.file_stem().unwrap_or_default().to_string_lossy();
     match volume_marker(&stem) {
@@ -836,10 +927,97 @@ fn is_cbz(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        chapter_number, is_sidecar_folder, later_volumes, series_title, sidecar_cover, volume_title,
+        Entry, Level, Location, Selection, chapter_number, is_sidecar_folder, later_volumes,
+        latest_volume_with_store, resume_location, series_title, sidecar_cover, volume_title,
     };
-    use crate::document::CbzDocument;
+    use crate::{
+        document::CbzDocument,
+        progress::{Position, ProgressStore},
+    };
     use std::{collections::BTreeSet, env, fs, path::Path, time::SystemTime};
+    use zip::write::SimpleFileOptions;
+
+    #[test]
+    fn returning_from_reader_keeps_the_original_selector_position() {
+        let directory = env::temp_dir();
+        let selection = Selection {
+            path: directory.join("Climber - Volume_02.cbz"),
+            page: Some(3),
+            location: Some(Location {
+                directory: directory.clone(),
+                level: Level::Series("Climber".into()),
+                selected: 4,
+            }),
+        };
+        let (resumed, level, selected) = resume_location(Some(&selection), Path::new("/").into());
+        assert_eq!(resumed, directory);
+        assert!(matches!(level, Level::Series(name) if name == "Climber"));
+        assert_eq!(selected, 4);
+        let direct = Selection::direct(selection.path.clone());
+        let (resumed, level, _) = resume_location(Some(&direct), Path::new("/").into());
+        assert_eq!(resumed, directory);
+        assert!(matches!(level, Level::Volume(path) if path == selection.path));
+    }
+
+    #[test]
+    fn series_last_read_opens_the_latest_volume_at_its_saved_chapter() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            env::temp_dir().join(format!("panel-series-last-{}-{unique}", std::process::id()));
+        fs::create_dir(&directory).unwrap();
+        let books: Vec<_> = (1..=2)
+            .map(|volume| directory.join(format!("Climber - Volume_{volume:02}.cbz")))
+            .collect();
+        for book in &books {
+            let mut archive = zip::ZipWriter::new(fs::File::create(book).unwrap());
+            for (chapter, page) in [(101, 0), (102, 1), (102, 2)] {
+                archive
+                    .start_file(
+                        format!("Chapter {chapter}/{page:03}.png"),
+                        SimpleFileOptions::default(),
+                    )
+                    .unwrap();
+                use std::io::Write;
+                archive.write_all(b"test page").unwrap();
+            }
+            archive.finish().unwrap();
+        }
+        let store = ProgressStore::in_memory().unwrap();
+        store
+            .save(&books[0], Position { page: 0, region: 0 }, false)
+            .unwrap();
+        store
+            .save(&books[1], Position { page: 2, region: 1 }, false)
+            .unwrap();
+        let older = books[0]
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        store
+            .connection()
+            .execute(
+                "UPDATE progress SET updated_at = 1 WHERE path = ?1",
+                [older],
+            )
+            .unwrap();
+        match latest_volume_with_store(&books, &store).unwrap() {
+            Entry::LastRead { path, description } => {
+                assert_eq!(path, books[1]);
+                assert_eq!(description, "Volume 2 · Chapter 102 · page 2");
+            }
+            _ => panic!("expected a last-read volume"),
+        }
+        store
+            .save(&books[0], Position { page: 0, region: 0 }, false)
+            .unwrap();
+        assert!(matches!(latest_volume_with_store(&books, &store),
+            Some(Entry::LastRead { path, .. }) if path == books[0]));
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn groups_single_volume() {

@@ -921,6 +921,7 @@ dependencies = [
  "gtk4",
  "image",
  "jpeg-decoder",
+ "libc",
  "natord",
  "ratatui",
  "ratatui-image",

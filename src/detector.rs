@@ -2,10 +2,16 @@ use std::{
     collections::VecDeque,
     env, fs,
     io::{BufRead, BufReader, Write},
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
-    sync::mpsc::{Receiver, SyncSender},
+    process::{self, Child, ChildStdin, ChildStdout, Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{Receiver, SyncSender, TrySendError},
+    },
     thread,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -42,10 +48,11 @@ pub fn spawn(
     start: usize,
     requests: Receiver<CommandMessage>,
     results: SyncSender<Result<ResultMessage, String>>,
+    cancel: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        if let Err(error) = run(&book, start, requests, &results) {
-            let _ = results.send(Err(error.to_string()));
+        if let Err(error) = run(&book, start, requests, &results, &cancel) {
+            let _ = results.try_send(Err(error.to_string()));
         }
     })
 }
@@ -84,10 +91,11 @@ fn run(
     start: usize,
     requests: Receiver<CommandMessage>,
     results: &SyncSender<Result<ResultMessage, String>>,
+    cancel: &AtomicBool,
 ) -> Result<()> {
     let mut process = Process::start()?;
     let store = ProgressStore::open()?;
-    run_with(book, start, requests, results, &mut process, &store)
+    run_with(book, start, requests, results, &mut process, &store, cancel)
 }
 
 fn run_with(
@@ -97,13 +105,20 @@ fn run_with(
     results: &SyncSender<Result<ResultMessage, String>>,
     process: &mut Process,
     store: &ProgressStore,
+    cancel: &AtomicBool,
 ) -> Result<()> {
     let mut documents = vec![(book.to_path_buf(), CbzDocument::open(book)?)];
     for path in library::later_volumes(book) {
         match CbzDocument::open(&path) {
             Ok(document) => documents.push((path, document)),
             Err(error) => {
-                let _ = results.send(Err(format!("skipping unreadable volume: {error}")));
+                if !send_result(
+                    results,
+                    Err(format!("skipping unreadable volume: {error}")),
+                    cancel,
+                ) {
+                    return Ok(());
+                }
             }
         }
     }
@@ -111,6 +126,9 @@ fn run_with(
     let mut queue = schedule(&counts, start);
 
     while !queue.is_empty() {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         while let Ok(message) = requests.try_recv() {
             match message {
                 CommandMessage::Prioritize(page) if page < counts[0] => {
@@ -160,14 +178,38 @@ fn run_with(
                     &result.source,
                     &result.regions,
                 )?;
-                let _ = results.send(Ok(result));
+                if !send_result(results, Ok(result), cancel) {
+                    return Ok(());
+                }
             }
             Err(error) => {
-                let _ = results.send(Err(error.to_string()));
+                if !send_result(results, Err(error.to_string()), cancel) {
+                    return Ok(());
+                }
             }
         }
     }
     Ok(())
+}
+
+fn send_result(
+    results: &SyncSender<Result<ResultMessage, String>>,
+    mut result: Result<ResultMessage, String>,
+    cancel: &AtomicBool,
+) -> bool {
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        match results.try_send(result) {
+            Ok(()) => return true,
+            Err(TrySendError::Disconnected(_)) => return false,
+            Err(TrySendError::Full(pending)) => {
+                result = pending;
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
 }
 
 struct Process {
@@ -185,10 +227,27 @@ impl Process {
     }
 
     fn start_with_command(command: impl AsRef<std::ffi::OsStr>) -> Result<Self> {
-        let mut child = Command::new(command)
+        let mut command = Command::new(command);
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        let parent = process::id() as libc::pid_t;
+        // q exits without waiting for an in-flight inference. Do not leave an
+        // orphaned model process behind if Panel exits before its worker ends.
+        // Only async-signal-safe syscalls are used between fork and exec.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != parent {
+                    return Err(std::io::Error::from_raw_os_error(libc::ECHILD));
+                }
+                Ok(())
+            });
+        }
+        let mut child = command
             .spawn()
             .context("failed to start external detector")?;
         let input = child.stdin.take().context("detector stdin unavailable")?;
@@ -450,7 +509,16 @@ mod tests {
         let mut process = Process::start_with_command(&script).unwrap();
         let (_requests_tx, requests) = mpsc::channel();
         let (results_tx, results_rx) = mpsc::sync_channel(8);
-        run_with(&books[0], 1, requests, &results_tx, &mut process, &store).unwrap();
+        run_with(
+            &books[0],
+            1,
+            requests,
+            &results_tx,
+            &mut process,
+            &store,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
         let results: Vec<_> = results_rx
             .try_iter()
             .map(|result| result.unwrap())

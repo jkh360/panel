@@ -13,7 +13,11 @@ use std::{
     path::PathBuf,
     process,
     rc::Rc,
-    sync::mpsc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
 };
 
@@ -31,6 +35,20 @@ use region::Region;
 
 const APPLICATION_ID: &str = "dev.panel.Reader";
 const GRUVBOX_DARK: &str = "#282828";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReaderExit {
+    Quit,
+    Library,
+}
+
+fn exit_key(key: gdk::Key) -> Option<ReaderExit> {
+    match key {
+        gdk::Key::Escape => Some(ReaderExit::Library),
+        gdk::Key::q => Some(ReaderExit::Quit),
+        _ => None,
+    }
+}
 
 enum WorkerRequest {
     Load { page: usize, generation: u64 },
@@ -92,7 +110,7 @@ fn main() {
         }
         return;
     }
-    let selection = match input_path() {
+    let mut selection = match input_path() {
         Ok(Some(selection)) => selection,
         Ok(None) => return,
         Err(error) => {
@@ -100,17 +118,36 @@ fn main() {
             process::exit(2);
         }
     };
-    let application = Application::builder()
-        .application_id(APPLICATION_ID)
-        .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
-        .build();
-    application.connect_activate(move |application| {
-        if let Err(error) = build_reader(application, selection.path.clone(), selection.page) {
-            eprintln!("panel: {error:#}");
-            application.quit();
+    loop {
+        let exit = Rc::new(Cell::new(ReaderExit::Quit));
+        let requested_exit = Rc::clone(&exit);
+        let application = Application::builder()
+            .application_id(APPLICATION_ID)
+            .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        let path = selection.path.clone();
+        let page = selection.page;
+        application.connect_activate(move |application| {
+            if let Err(error) =
+                build_reader(application, path.clone(), page, Rc::clone(&requested_exit))
+            {
+                eprintln!("panel: {error:#}");
+                application.quit();
+            }
+        });
+        application.run_with_args::<&str>(&[]);
+        if exit.get() == ReaderExit::Quit {
+            break;
         }
-    });
-    application.run_with_args::<&str>(&[]);
+        selection = match library::select(Some(&selection)) {
+            Ok(Some(selection)) => selection,
+            Ok(None) => break,
+            Err(error) => {
+                eprintln!("panel: {error:#}");
+                process::exit(2);
+            }
+        };
+    }
 }
 
 fn analyze_cli(path: &std::path::Path) -> Result<()> {
@@ -198,7 +235,7 @@ fn json_escape(value: &str) -> String {
 fn input_path() -> Result<Option<library::Selection>> {
     let mut arguments = env::args_os().skip(1);
     let Some(path) = arguments.next() else {
-        return library::select();
+        return library::select(None);
     };
     if arguments.next().is_some() {
         bail!("expected exactly one document path");
@@ -211,13 +248,14 @@ fn input_path() -> Result<Option<library::Selection>> {
     {
         bail!("the first build supports CBZ input only");
     }
-    Ok(Some(library::Selection { path, page: None }))
+    Ok(Some(library::Selection::direct(path)))
 }
 
 fn build_reader(
     application: &Application,
     path: PathBuf,
     initial_page: Option<usize>,
+    exit: Rc<Cell<ReaderExit>>,
 ) -> Result<()> {
     install_css();
     let mut document = CbzDocument::open(&path)?;
@@ -277,18 +315,21 @@ fn build_reader(
     let worker = Rc::new(RefCell::new(Some(worker)));
     let (detector_requests, external_requests) = mpsc::sync_channel(8);
     let (external_results, detector_results) = mpsc::sync_channel(8);
+    let detector_cancel = Arc::new(AtomicBool::new(false));
     let detector_worker = detector::configured().then(|| {
         detector::spawn(
             path.clone(),
             position.page,
             external_requests,
             external_results,
+            Arc::clone(&detector_cancel),
         )
     });
     let detector_worker = Rc::new(RefCell::new(detector_worker));
     let detector_requests = Rc::new(detector_requests);
     let generation = Rc::new(Cell::new(0_u64));
     let pending = Rc::new(Cell::new(false));
+    let alive = Rc::new(Cell::new(true));
 
     let view = PageView::new();
     view.set_zoom(reader.borrow().progress.load_zoom(&path)?);
@@ -334,7 +375,11 @@ fn build_reader(
         let status = status.clone();
         let generation = Rc::clone(&generation);
         let pending = Rc::clone(&pending);
+        let alive = Rc::clone(&alive);
         glib::timeout_add_local(std::time::Duration::from_millis(8), move || {
+            if !alive.get() {
+                return glib::ControlFlow::Break;
+            }
             while let Ok(result) = results.try_recv() {
                 pending.set(false);
                 match result {
@@ -387,7 +432,11 @@ fn build_reader(
         let reader = Rc::clone(&reader);
         let view = view.clone();
         let status = status.clone();
+        let alive = Rc::clone(&alive);
         glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            if !alive.get() {
+                return glib::ControlFlow::Break;
+            }
             while let Ok(result) = detector_results.try_recv() {
                 match result {
                     Ok(result) => {
@@ -437,10 +486,14 @@ fn build_reader(
         let detector_requests = Rc::clone(&detector_requests);
         let zoom_indicator = zoom_indicator.clone();
         let zoom_timeout = Rc::clone(&zoom_timeout);
-        let window = window.clone();
+        let weak_window = window.downgrade();
+        let exit = Rc::clone(&exit);
         keys.connect_key_pressed(move |_, key, _, _| {
-            if matches!(key, gdk::Key::q | gdk::Key::Escape) {
-                window.close();
+            if let Some(action) = exit_key(key) {
+                exit.set(action);
+                if let Some(window) = weak_window.upgrade() {
+                    window.close();
+                }
                 return glib::Propagation::Stop;
             }
             let zoom_step = match key {
@@ -536,7 +589,10 @@ fn build_reader(
         let detector_requests = Rc::clone(&detector_requests);
         let detector_worker = Rc::clone(&detector_worker);
         let reader = Rc::clone(&reader);
+        let alive = Rc::clone(&alive);
         window.connect_close_request(move |_| {
+            alive.set(false);
+            detector_cancel.store(true, Ordering::Relaxed);
             let reader = reader.borrow();
             if let Err(error) = reader.progress.save(
                 &reader.path,
@@ -548,11 +604,15 @@ fn build_reader(
             drop(reader);
             let _ = requests.try_send(WorkerRequest::Stop);
             if let Some(worker) = worker.borrow_mut().take() {
-                let _ = worker.join();
+                thread::spawn(move || {
+                    let _ = worker.join();
+                });
             }
             let _ = detector_requests.try_send(detector::CommandMessage::Stop);
             if let Some(worker) = detector_worker.borrow_mut().take() {
-                let _ = worker.join();
+                thread::spawn(move || {
+                    let _ = worker.join();
+                });
             }
             glib::Propagation::Proceed
         });
@@ -742,14 +802,22 @@ fn install_css() {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_or_detect, restored_region};
+    use super::{ReaderExit, exit_key, load_or_detect, restored_region};
     use crate::{
         detection_cache,
         progress::{Position, ProgressStore},
         region::Region,
     };
+    use gtk::gdk;
     use image::RgbaImage;
     use std::{fs, time::SystemTime};
+
+    #[test]
+    fn escape_returns_to_library_and_q_quits() {
+        assert_eq!(exit_key(gdk::Key::Escape), Some(ReaderExit::Library));
+        assert_eq!(exit_key(gdk::Key::q), Some(ReaderExit::Quit));
+        assert_eq!(exit_key(gdk::Key::w), None);
+    }
 
     #[test]
     fn restores_saved_panel_unless_a_chapter_was_chosen() {

@@ -57,6 +57,36 @@ impl ProgressStore {
         }))
     }
 
+    /// The most recently visited book among the volumes currently displayed.
+    pub fn most_recent(&self, books: &[PathBuf]) -> Result<Option<(PathBuf, Position)>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT page, region, updated_at FROM progress WHERE path = ?1")?;
+        let mut latest = None;
+        for book in books {
+            let path = document_key(book)?;
+            let saved: Option<(i64, i64, i64)> = statement
+                .query_row([path], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .optional()?;
+            if let Some((page, region, updated_at)) = saved {
+                if latest
+                    .as_ref()
+                    .is_none_or(|(time, _, _)| updated_at > *time)
+                {
+                    latest = Some((
+                        updated_at,
+                        book.clone(),
+                        Position {
+                            page: page.try_into().unwrap_or(0),
+                            region: region.try_into().unwrap_or(0),
+                        },
+                    ));
+                }
+            }
+        }
+        Ok(latest.map(|(_, book, position)| (book, position)))
+    }
+
     pub fn load_zoom(&self, path: &Path) -> Result<f32> {
         let path = document_key(path)?;
         let zoom: Option<f32> = self
@@ -88,7 +118,7 @@ impl ProgressStore {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs() as i64;
+            .as_millis() as i64;
         self.connection.execute(
             "INSERT INTO progress(path, page, region, completed, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5)
