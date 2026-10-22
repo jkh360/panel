@@ -2,7 +2,7 @@
 
 A minimal, keyboard-first manga reader for Linux. Browse CBZ manga in a terminal library, then read in a native GTK window with automatic reading regions and saved progress. An optional external detector can provide better regions; no models or manga are bundled.
 
-Run `panel` to browse from your home directory, or `panel book.cbz` to open a book directly. In the library, press `d` to make the current directory your default starting folder.
+Run `panel` to browse from your home directory, or `panel book.cbz` to open a book directly. In the library, press `d` to make the current directory your default starting folder. A series' **Last read** entry resumes the most recently opened volume at its saved chapter and page; volumes also have their own **Last read** entries.
 
 ## Controls
 
@@ -21,7 +21,8 @@ Run `panel` to browse from your home directory, or `panel book.cbz` to open a bo
 | `f` / `c` / `w` | Focus / crop / whole-page mode |
 | `Tab` | Cycle view modes |
 | `+` / `-` | Zoom in / out |
-| `q` / `Esc` | Quit |
+| `Esc` | Return to the terminal library |
+| `q` | Quit Panel entirely |
 
 In whole-page mode, `j` and `k` also move between pages. Page direction follows right-to-left manga reading order.
 
