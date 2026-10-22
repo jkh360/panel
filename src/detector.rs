@@ -12,7 +12,11 @@ use anyhow::{Context, Result, bail, ensure};
 use image::RgbaImage;
 
 use crate::{
-    detection_cache, document::CbzDocument, library, progress::ProgressStore, region::Region,
+    detection_cache,
+    document::CbzDocument,
+    library,
+    progress::ProgressStore,
+    region::{Region, order_rtl},
 };
 
 pub enum CommandMessage {
@@ -309,21 +313,14 @@ fn sanitize(regions: Vec<Region>, width: u32, height: u32) -> Vec<Region> {
         })
         .filter(|region| region.area() as f64 / page_area as f64 >= 0.025)
         .collect();
-    output.sort_by(|a, b| {
-        let tolerance = a.height.min(b.height) / 3;
-        if a.y.abs_diff(b.y) <= tolerance {
-            b.x.cmp(&a.x)
-        } else {
-            a.y.cmp(&b.y)
-        }
-    });
+    order_rtl(&mut output);
     output
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Process, Task, parse_response, prioritize, run_with, schedule};
-    use crate::{detection_cache, progress::ProgressStore};
+    use super::{Process, Task, parse_response, prioritize, run_with, sanitize, schedule};
+    use crate::{detection_cache, progress::ProgressStore, region::Region};
     use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
     use std::{
         fs,
@@ -346,6 +343,32 @@ mod tests {
         assert_eq!(result.source, "example");
         assert_eq!(result.regions[0].width, 30);
         assert_eq!(result.seconds, Some(1.25));
+    }
+
+    #[test]
+    fn worker_panels_keep_the_right_column_together() {
+        let left = Region {
+            x: 0,
+            y: 0,
+            width: 90,
+            height: 210,
+        };
+        let top = Region {
+            x: 110,
+            y: 0,
+            width: 90,
+            height: 90,
+        };
+        let bottom = Region {
+            x: 110,
+            y: 110,
+            width: 90,
+            height: 90,
+        };
+        assert_eq!(
+            sanitize(vec![left, bottom, top], 200, 210),
+            [top, bottom, left]
+        );
     }
 
     #[test]

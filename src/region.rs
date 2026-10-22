@@ -284,15 +284,82 @@ fn fallback_reason(regions: &[Region], page: Region) -> Option<&'static str> {
     None
 }
 
-fn order_rtl(regions: &mut [Region]) {
-    regions.sort_by(|a, b| {
-        let tolerance = a.height.min(b.height) / 3;
-        if a.y.abs_diff(b.y) <= tolerance {
-            b.x.cmp(&a.x)
+/// Order panel *groups*, not individual top edges. A page-wide horizontal
+/// gutter separates reading tiers; otherwise an uninterrupted vertical gutter
+/// separates columns. In a grid, tiers take precedence over columns.
+pub(crate) fn order_rtl(regions: &mut [Region]) {
+    let mut ordered = Vec::with_capacity(regions.len());
+    order_group(regions.to_vec(), &mut ordered);
+    regions.copy_from_slice(&ordered);
+}
+
+fn order_group(group: Vec<Region>, ordered: &mut Vec<Region>) {
+    if group.len() < 2 {
+        ordered.extend(group);
+        return;
+    }
+    if let Some((top, bottom)) = divide(&group, true) {
+        order_group(top, ordered);
+        order_group(bottom, ordered);
+    } else if let Some((left, right)) = divide(&group, false) {
+        order_group(right, ordered);
+        order_group(left, ordered);
+    } else {
+        // An overlapping/irregular layout has no reliable full-length gutter.
+        // Use a deterministic fallback rather than a non-transitive comparator.
+        let mut group = group;
+        group.sort_by_key(|r| (r.y, std::cmp::Reverse(r.x), r.bottom(), r.right()));
+        ordered.extend(group);
+    }
+}
+
+fn divide(group: &[Region], horizontal: bool) -> Option<(Vec<Region>, Vec<Region>)> {
+    let mut best: Option<(u32, usize, u32)> = None;
+    for panel in group {
+        let cut = if horizontal {
+            panel.bottom()
         } else {
-            a.y.cmp(&b.y)
+            panel.right()
+        };
+        let mut before = 0;
+        let mut after = 0;
+        let mut nearest = u32::MAX;
+        let mut crossed = false;
+        for candidate in group {
+            let (start, end) = if horizontal {
+                (candidate.y, candidate.bottom())
+            } else {
+                (candidate.x, candidate.right())
+            };
+            if end <= cut {
+                before += 1;
+            } else if start >= cut {
+                after += 1;
+                nearest = nearest.min(start);
+            } else {
+                crossed = true;
+                break;
+            }
+        }
+        if crossed || before == 0 || after == 0 {
+            continue;
+        }
+        // Prefer a clear gutter, then a balanced split. A zero-width gutter
+        // still counts when panel rectangles meet exactly at their edges.
+        let candidate = (nearest - cut, before.min(after), cut);
+        if best.is_none_or(|previous| candidate > previous) {
+            best = Some(candidate);
+        }
+    }
+    let cut = best?.2;
+    let (before, after) = group.iter().copied().partition(|r| {
+        if horizontal {
+            r.bottom() <= cut
+        } else {
+            r.right() <= cut
         }
     });
+    Some((before, after))
 }
 
 pub fn padded(region: Region, page_width: u32, page_height: u32) -> Region {
@@ -313,7 +380,60 @@ pub fn padded(region: Region, page_width: u32, page_height: u32) -> Region {
 mod tests {
     use image::{Rgba, RgbaImage};
 
-    use super::detect;
+    use super::{Region, detect, order_rtl};
+
+    fn panel(x: u32, y: u32, width: u32, height: u32) -> Region {
+        Region {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn finishes_right_stack_before_tall_left_panel() {
+        let left = panel(0, 0, 90, 210);
+        let top_right = panel(110, 0, 90, 90);
+        let bottom_right = panel(110, 110, 90, 90);
+        let mut regions = [left, bottom_right, top_right];
+        order_rtl(&mut regions);
+        assert_eq!(regions, [top_right, bottom_right, left]);
+        order_rtl(&mut regions);
+        assert_eq!(regions, [top_right, bottom_right, left]);
+    }
+
+    #[test]
+    fn reads_two_by_two_grid_by_rows_not_columns() {
+        let top_left = panel(0, 0, 90, 90);
+        let top_right = panel(110, 0, 90, 90);
+        let bottom_left = panel(0, 110, 90, 90);
+        let bottom_right = panel(110, 110, 90, 90);
+        let mut regions = [bottom_left, bottom_right, top_left, top_right];
+        order_rtl(&mut regions);
+        assert_eq!(regions, [top_right, top_left, bottom_right, bottom_left]);
+    }
+
+    #[test]
+    fn reads_full_width_header_before_both_columns() {
+        let header = panel(0, 0, 200, 60);
+        let left = panel(0, 80, 90, 210);
+        let top_right = panel(110, 80, 90, 90);
+        let bottom_right = panel(110, 190, 90, 90);
+        let mut regions = [left, bottom_right, header, top_right];
+        order_rtl(&mut regions);
+        assert_eq!(regions, [header, top_right, bottom_right, left]);
+    }
+
+    #[test]
+    fn ambiguous_overlaps_have_a_deterministic_fallback() {
+        let left = panel(0, 0, 115, 210);
+        let top_right = panel(110, 0, 90, 90);
+        let bottom_right = panel(110, 110, 90, 90);
+        let mut regions = [bottom_right, left, top_right];
+        order_rtl(&mut regions);
+        assert_eq!(regions, [top_right, left, bottom_right]);
+    }
 
     #[test]
     fn splits_two_panels_across_a_white_gutter() {

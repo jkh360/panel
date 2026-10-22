@@ -2,7 +2,12 @@ use std::{fs, path::Path};
 
 use anyhow::{Context, Result, bail, ensure};
 
-use crate::{detection_cache, document::CbzDocument, progress::ProgressStore, region::Region};
+use crate::{
+    detection_cache,
+    document::CbzDocument,
+    progress::ProgressStore,
+    region::{Region, order_rtl},
+};
 
 pub fn run(book: &Path, predictions: &Path) -> Result<()> {
     let document = CbzDocument::open(book)?;
@@ -194,20 +199,14 @@ fn sanitize(regions: Vec<Region>, width: u32, height: u32) -> Vec<Region> {
         })
         .filter(|r| r.area() as f64 / page_area as f64 >= 0.025)
         .collect();
-    output.sort_by(|a, b| {
-        let tolerance = a.height.min(b.height) / 3;
-        if a.y.abs_diff(b.y) <= tolerance {
-            b.x.cmp(&a.x)
-        } else {
-            a.y.cmp(&b.y)
-        }
-    });
+    order_rtl(&mut output);
     output
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_records;
+    use super::{parse_records, sanitize};
+    use crate::region::Region;
     #[test]
     fn parses_region_output() {
         let r = parse_records(
@@ -216,5 +215,31 @@ mod tests {
         .unwrap();
         assert_eq!(r[0].page, 0);
         assert_eq!(r[0].regions[0].width, 30);
+    }
+
+    #[test]
+    fn imported_panels_keep_the_right_column_together() {
+        let left = Region {
+            x: 0,
+            y: 0,
+            width: 90,
+            height: 210,
+        };
+        let top = Region {
+            x: 110,
+            y: 0,
+            width: 90,
+            height: 90,
+        };
+        let bottom = Region {
+            x: 110,
+            y: 110,
+            width: 90,
+            height: 90,
+        };
+        assert_eq!(
+            sanitize(vec![left, bottom, top], 200, 210),
+            [top, bottom, left]
+        );
     }
 }
