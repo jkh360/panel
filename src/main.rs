@@ -402,9 +402,7 @@ fn build_reader(
                             loaded.image.width(),
                             loaded.image.height(),
                         ) {
-                            detection.regions = external.regions;
-                            detection.source = external.source;
-                            detection.fallback_reason = None;
+                            apply_external(&mut detection, external);
                         }
                         reader.page = make_page(loaded.image, detection);
                         present(&reader, &view, &status, false);
@@ -455,9 +453,11 @@ fn build_reader(
                             continue;
                         }
                         if reader.position.page == result.page {
+                            let mut regions = result.regions;
+                            region::order_rtl(&mut regions);
                             reader.page = Page {
                                 texture: reader.page.texture.clone(),
-                                regions: result.regions,
+                                regions,
                                 source: result.source,
                                 fallback_reason: None,
                             };
@@ -682,6 +682,16 @@ fn ordered(mut detection: DetectionResult) -> DetectionResult {
     detection
 }
 
+fn apply_external(detection: &mut DetectionResult, external: CachedDetection) {
+    if external.regions.is_empty() {
+        return;
+    }
+    detection.regions = external.regions;
+    detection.source = external.source;
+    detection.fallback_reason = None;
+    region::order_rtl(&mut detection.regions);
+}
+
 fn detect_regions(image: &RgbaImage) -> DetectionResult {
     let detection = region::detect(image);
     let fallback_reason = detection.fallback_reason.map(str::to_owned);
@@ -699,6 +709,7 @@ fn detect_regions(image: &RgbaImage) -> DetectionResult {
 }
 
 fn make_page(image: RgbaImage, detection: DetectionResult) -> Page {
+    let detection = ordered(detection);
     Page {
         texture: texture(image),
         regions: detection.regions,
@@ -802,9 +813,11 @@ fn install_css() {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReaderExit, exit_key, load_or_detect, restored_region};
+    use super::{
+        DetectionResult, ReaderExit, apply_external, exit_key, load_or_detect, restored_region,
+    };
     use crate::{
-        detection_cache,
+        detection_cache::{self, CachedDetection},
         progress::{Position, ProgressStore},
         region::Region,
     };
@@ -828,6 +841,60 @@ mod tests {
         assert_eq!(restored_region(saved, None, 5), 3);
         assert_eq!(restored_region(saved, None, 2), 1);
         assert_eq!(restored_region(saved, Some(12), 5), 0);
+    }
+
+    #[test]
+    fn late_external_cache_override_uses_the_new_order() {
+        let left = Region {
+            x: 0,
+            y: 0,
+            width: 110,
+            height: 200,
+        };
+        let top = Region {
+            x: 120,
+            y: 10,
+            width: 80,
+            height: 80,
+        };
+        let bottom = Region {
+            x: 120,
+            y: 100,
+            width: 80,
+            height: 95,
+        };
+        let footer = Region {
+            x: 0,
+            y: 198,
+            width: 200,
+            height: 70,
+        };
+        let mut detection = DetectionResult {
+            regions: vec![footer],
+            source: "gutter".into(),
+            fallback_reason: Some("old analysis".into()),
+            cached: true,
+        };
+        apply_external(
+            &mut detection,
+            CachedDetection {
+                regions: vec![top, left, bottom, footer],
+                source: "magi".into(),
+                fallback_reason: None,
+            },
+        );
+        assert_eq!(detection.regions, [top, bottom, left, footer]);
+        assert_eq!(detection.source, "magi");
+        assert_eq!(detection.fallback_reason, None);
+        apply_external(
+            &mut detection,
+            CachedDetection {
+                regions: vec![],
+                source: "broken".into(),
+                fallback_reason: None,
+            },
+        );
+        assert_eq!(detection.regions, [top, bottom, left, footer]);
     }
 
     #[test]
