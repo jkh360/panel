@@ -1,6 +1,8 @@
 mod detection_cache;
 mod detector;
 mod document;
+mod hn_client;
+mod hn_search;
 mod import_regions;
 mod library;
 mod page_view;

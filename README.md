@@ -12,6 +12,7 @@ Run `panel` to browse from your home directory, or `panel book.cbz` to open a bo
 | `l` / `Enter` | Open |
 | `h` | Go back |
 | `d` | Set default folder |
+| `s` / `/` | Experimental HaruNeko metadata search (`panel-hn` only; online gate remains closed) |
 | `q` | Quit |
 
 | Reader | Action |
@@ -25,5 +26,10 @@ Run `panel` to browse from your home directory, or `panel book.cbz` to open a bo
 | `q` | Quit Panel entirely |
 
 In whole-page mode, `j` and `k` also move between pages. Page direction follows right-to-left manga reading order.
+
+On `panel-hn`, Search is a read-only source/title/chapter browser. It cannot
+contact sites while certificate verification is under review; it cannot
+download chapters. Loaded sources are not verified websites. The stable
+`master` branch does not contain the HaruNeko backend.
 
 GPL-3.0-only.

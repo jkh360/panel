@@ -2,9 +2,10 @@
 
 Source: https://github.com/manga-download/haruneko, pinned in `vendor/haruneko`.
 The upstream Unlicense covers its code, **not** content served by websites.
-This experimental branch has a **standalone** source-catalog, title-search,
-and chapter-listing prototype, not yet wired into Panel's TUI. It has **no**
-download feature. `hn/build.sh` compiles the pinned upstream engine/connectors
+This experimental branch wires a metadata-only source-catalog, title-search,
+and chapter-listing prototype to the TUI (`s` or `/` in the library). The
+online startup gate still prevents all site access. It has **no** download
+feature. `hn/build.sh` compiles the pinned upstream engine/connectors
 and Panel's private Electron bridge with Node.js 24, excluding the upstream GUI
 and Electron entry. Earlier isolated tests listed 826 connectors and completed
 MangaDex search and chapter listing; no other site has been verified.
@@ -15,8 +16,11 @@ The bridge removes it from its own Node trust before any networking, and a
 separate Chromium certificate policy rejects chains identifying that issuer
 without overriding other certificate failures. These policies have **offline
 unit tests only**; Chromium's real-chain behavior has not been verified.
-An independent fail-closed gate still prevents the bridge from starting.
-`hn/test-backend.sh` verifies this without visiting a site. Do not run live
+An independent fail-closed gate still prevents the bridge from starting,
+including when opened from the TUI. `hn/test-backend.sh` verifies this without
+visiting a site. The TUI only starts the backend on an explicit Search action,
+uses the namespaced sandbox launcher, bounds and sanitizes metadata replies,
+and cancels the child on exit. Do not run live
 website tests, add downloads, or remove the gate until both trust paths are
 verified end-to-end. See [certifi advisory](https://github.com/advisories/GHSA-6q48-6c7w-9gw2)
 and the [PHP RCE advisory](https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w).

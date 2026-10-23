@@ -393,6 +393,11 @@ impl Library {
             }
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => return Ok(None),
+                KeyCode::Char('s') | KeyCode::Char('/') => {
+                    if let Err(error) = crate::hn_search::browse(terminal) {
+                        self.notice = Some(format!("Search unavailable: {error}"));
+                    }
+                }
                 KeyCode::Char('j') | KeyCode::Down => {
                     let next = (self.selected + 1).min(self.entries.len().saturating_sub(1));
                     if next != self.selected {
@@ -583,10 +588,9 @@ impl Library {
             &mut state,
         );
         self.draw_preview(frame, columns[1]);
-        let hint = self
-            .notice
-            .as_deref()
-            .unwrap_or(" j/k move  ·  l/Enter open  ·  h back  ·  d set default  ·  q quit");
+        let hint = self.notice.as_deref().unwrap_or(
+            " j/k move  ·  l/Enter open  ·  h back  ·  s search  ·  d default  ·  q quit",
+        );
         frame.render_widget(
             Paragraph::new(hint)
                 .style(Style::default().fg(MUTED).bg(BG))

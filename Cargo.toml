@@ -9,6 +9,7 @@ rust-version = "1.85"
 
 [dependencies]
 anyhow = "1.0"
+base64 = "0.21"
 crossterm = "0.28"
 ratatui = "0.29"
 ratatui-image = { version = "4.2", default-features = false }

@@ -8,6 +8,7 @@ import { FetchProvider } from '../../vendor/haruneko/app/electron/src/ipc/FetchP
 import { registerRemoteWindows } from './remote-windows';
 import { certificateDecision } from './ca-policy.mjs';
 import { removeCompromisedNodeRoot } from './node-ca.mjs';
+import { decodeField, encodeItems } from './metadata-wire.mjs';
 
 if (process.env.PANEL_HN_NET_ISOLATED !== '1') {
     console.error('panel-hn: refusing to run outside hn/net-sandbox.sh');
@@ -149,17 +150,30 @@ async function run(): Promise<void> {
     input.on('line', line => {
         queue = queue.then(async () => {
             let id: unknown = null;
+            let panelRequest = false;
             try {
                 if (line.length > 16_384) throw new Error('oversized request');
                 const request = JSON.parse(line);
                 id = typeof request.id === 'number' && Number.isSafeInteger(request.id) ? request.id : null;
                 let operation: string;
-                if (request.op === 'sources') {
+                panelRequest = ['sources-panel', 'search-panel', 'chapters-panel'].includes(request.op);
+                if (request.op === 'sources' || request.op === 'sources-panel') {
                     operation = 'globalThis.panelHN.sources()';
+                } else if (request.op === 'search-panel'
+                    && typeof request.source === 'string' && /^[a-z0-9_-]{1,80}$/.test(request.source)) {
+                    const query = decodeField(request.queryB64, 480);
+                    if ([...query].length < 2 || [...query].length > 120) throw new Error('invalid search');
+                    operation = `globalThis.panelHN.search(${JSON.stringify(request.source)},${JSON.stringify(query)})`;
                 } else if (request.op === 'search'
                     && typeof request.source === 'string' && /^[a-z0-9_-]{1,80}$/.test(request.source)
                     && typeof request.query === 'string' && request.query.length >= 2 && request.query.length <= 120) {
                     operation = `globalThis.panelHN.search(${JSON.stringify(request.source)},${JSON.stringify(request.query)})`;
+                } else if (request.op === 'chapters-panel'
+                    && typeof request.source === 'string' && /^[a-z0-9_-]{1,80}$/.test(request.source)) {
+                    const mangaId = decodeField(request.mangaIdB64, 1024);
+                    const mangaTitle = decodeField(request.mangaTitleB64, 1024);
+                    if (!mangaId || !mangaTitle) throw new Error('invalid chapter request');
+                    operation = `globalThis.panelHN.chapters(${JSON.stringify(request.source)},${JSON.stringify(mangaId)},${JSON.stringify(mangaTitle)})`;
                 } else if (request.op === 'chapters'
                     && typeof request.source === 'string' && /^[a-z0-9_-]{1,80}$/.test(request.source)
                     && typeof request.mangaId === 'string' && request.mangaId.length > 0 && request.mangaId.length <= 1024
@@ -167,11 +181,19 @@ async function run(): Promise<void> {
                     operation = `globalThis.panelHN.chapters(${JSON.stringify(request.source)},${JSON.stringify(request.mangaId)},${JSON.stringify(request.mangaTitle)})`;
                 } else throw new Error('unknown or invalid operation');
                 const results = await browser.executeJavaScript(operation);
-                process.stdout.write(JSON.stringify({ id, results }) + '\n');
+                if (panelRequest) {
+                    process.stdout.write(encodeItems(id, results));
+                } else {
+                    process.stdout.write(JSON.stringify({ id, results }) + '\n');
+                }
             } catch {
                 // Connector exceptions may contain URLs, credentials or page data;
                 // never print them into Panel's log or forward them to the TUI.
-                process.stdout.write(JSON.stringify({ id, error: 'request failed' }) + '\n');
+                if (panelRequest) {
+                    process.stdout.write(`${id ?? 0}\terror\n`);
+                } else {
+                    process.stdout.write(JSON.stringify({ id, error: 'request failed' }) + '\n');
+                }
             }
         });
     });
