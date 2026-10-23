@@ -1,5 +1,5 @@
 //! Experimental metadata-only HaruNeko client. The backend remains behind its
-//! independent certificate-review gate; never launch it outside net-sandbox.sh.
+//! explicit online-metadata opt-in; never launch it outside net-sandbox.sh.
 use std::{
     env,
     io::{BufRead, BufReader, Read, Write},

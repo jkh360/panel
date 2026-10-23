@@ -25,8 +25,10 @@ try {
     console.error('panel-hn: online backend paused: could not constrain CA trust');
     process.exit(1);
 }
-console.error('panel-hn: online backend paused pending remote-window and fetch review');
-process.exit(1);
+if (process.env.PANEL_HN_ENABLE_METADATA !== '1') {
+    console.error('panel-hn: online backend paused; set PANEL_HN_ENABLE_METADATA=1 for opt-in');
+    process.exit(1);
+}
 
 // No external asset server, remote app URL, RPC listener, or debugging port.
 protocol.registerSchemesAsPrivileged([{ scheme: 'panel-hn', privileges: {

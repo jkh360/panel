@@ -2,6 +2,7 @@
 # Offline fail-closed regression while online metadata remains gated.
 # This intentionally makes NO website requests.
 set -eu
+unset PANEL_HN_ENABLE_METADATA
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 for tool in electron Xvfb timeout; do
     command -v "$tool" >/dev/null || { echo "panel-hn: missing $tool" >&2; exit 1; }

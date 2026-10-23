@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import type { IPC } from '../../vendor/haruneko/app/electron/src/ipc/InterProcessCommunication';
 import { Channels } from '../../vendor/haruneko/app/electron/src/ipc/InterProcessCommunicationChannels';
-import { remoteHeaders, sameOriginWebsite, websiteURL } from './net-policy.mjs';
+import { guardRemoteNavigation, remoteHeaders, websiteURL } from './net-policy.mjs';
 
 // Unlike upstream's controller, never accept renderer-supplied webPreferences
 // or expose arbitrary existing BrowserWindows by ID. The caller is restricted
@@ -58,13 +58,8 @@ export function registerRemoteWindows(ipc: IPC): void {
         win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
         win.webContents.session.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false));
         win.webContents.session.setPermissionCheckHandler(() => false);
-        const allowNavigation = (event: Electron.Event, url: string) => {
-            if (!sameOriginWebsite(url, windows.get(win.id)?.allowedOrigin)) event.preventDefault();
-        };
-        win.webContents.on('will-navigate', allowNavigation);
-        // A main-frame redirect must not carry loadURL's connector headers to
-        // an unrelated origin (including a local service or a new web domain).
-        win.webContents.on('will-redirect', allowNavigation);
+        // A redirect must not carry connector headers to another origin.
+        guardRemoteNavigation(win.webContents, () => windows.get(win.id)?.allowedOrigin);
         win.webContents.on('did-start-navigation', (_event, url, isMainFrame, isSameDocument) => {
             ipc.Send(Channels.RemoteBrowserWindowController.OnBeforeNavigate, win.id, url, isMainFrame, isSameDocument);
         });
@@ -108,7 +103,12 @@ export function registerRemoteWindows(ipc: IPC): void {
     ipc.Handle(Channels.RemoteBrowserWindowController.ExecuteScript, async (id: number, script: string) => {
         if (typeof script !== 'string' || script.length > 262_144) throw new Error('script limit');
         const win = get(id);
-        return bounded(win, win.webContents.executeJavaScript(script, true), 15_000);
+        const result = await bounded(win, win.webContents.executeJavaScript(script, true), 15_000);
+        // Bound what the pinned connector can relay into Panel's renderer.
+        // Electron must deserialize the result first; this is not a RAM cap.
+        const encoded = JSON.stringify(result);
+        if (encoded && Buffer.byteLength(encoded) > 2_000_000) throw new Error('script result limit');
+        return result;
     });
     ipc.Handle(Channels.RemoteBrowserWindowController.SendDebugCommand, async () => {
         throw new Error('remote debugging disabled');

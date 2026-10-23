@@ -19,6 +19,8 @@
 !/hn/test-sandbox.sh
 !/hn/test-backend.sh
 !/hn/test-certificates.sh
+!/hn/test-boundaries.sh
+!/hn/test-metadata-offline.sh
 !/hn/web/
 !/hn/web/index.html
 !/hn/web/entry.ts
@@ -32,6 +34,9 @@
 !/hn/app/net-policy.test.mjs
 !/hn/app/certificate-probe.cjs
 !/hn/app/certificate-probe-run.sh
+!/hn/app/boundary-probe.cjs
+!/hn/app/boundary-preload.cjs
+!/hn/app/boundary-probe-run.sh
 !/hn/app/ca-policy.mjs
 !/hn/app/ca-policy.test.mjs
 !/hn/app/node-ca.mjs

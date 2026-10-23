@@ -20,6 +20,14 @@ export function sameOriginWebsite(value, allowedOrigin) {
     }
 }
 
+export function guardRemoteNavigation(contents, allowedOrigin) {
+    const check = (event, url) => {
+        if (!sameOriginWebsite(url, allowedOrigin())) event.preventDefault();
+    };
+    contents.on('will-navigate', check);
+    contents.on('will-redirect', check);
+}
+
 const forbiddenHeaders = new Set([
     'cookie', 'authorization', 'proxy-authorization', 'host', 'origin',
     'sec-fetch-site', 'sec-fetch-mode', 'sec-fetch-dest',

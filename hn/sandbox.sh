@@ -1,6 +1,6 @@
 #!/bin/sh
 # Run the experimental browser backend without the host home or browser data.
-# This is not enabled by Panel until the headless backend has passed review.
+# Online metadata remains disabled unless the user explicitly opts in.
 set -eu
 if [ "$#" -lt 1 ]; then
     echo 'usage: hn/sandbox.sh COMMAND [ARG...]' >&2
@@ -40,6 +40,7 @@ set -- --clearenv --die-with-parent --new-session --unshare-ipc --unshare-pid \
     --setenv LANG C.UTF-8 \
     --setenv FONTCONFIG_FILE /etc/fonts/fonts.conf \
     --setenv PANEL_HN_NET_ISOLATED "${PANEL_HN_NET_ISOLATED:-0}" \
+    --setenv PANEL_HN_ENABLE_METADATA "${PANEL_HN_ENABLE_METADATA:-0}" \
     "$@"
 # Bind runtime directories only when present. Never bind an entire home or /run.
 for directory in /nix/store /usr /lib /lib64 /bin /sbin; do
