@@ -27,6 +27,9 @@
 !/hn/web/no-frontend.ts
 !/hn/app/
 !/hn/app/main.ts
+!/hn/app/anonymous-fetch.ts
+!/hn/app/net-policy.mjs
+!/hn/app/net-policy.test.mjs
 !/hn/app/certificate-probe.cjs
 !/hn/app/certificate-probe-run.sh
 !/hn/app/ca-policy.mjs

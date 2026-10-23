@@ -4,27 +4,28 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import readline from 'node:readline';
 import { IPC } from '../../vendor/haruneko/app/electron/src/ipc/InterProcessCommunication';
-import { FetchProvider } from '../../vendor/haruneko/app/electron/src/ipc/FetchProvider';
+import { registerAnonymousFetch } from './anonymous-fetch';
 import { registerRemoteWindows } from './remote-windows';
 import { certificateDecision } from './ca-policy.mjs';
 import { removeCompromisedNodeRoot } from './node-ca.mjs';
 import { decodeField, encodeItems } from './metadata-wire.mjs';
 import { isTrustedSender } from './ipc-policy.mjs';
+import { safeHeaderName, websiteURL } from './net-policy.mjs';
 
 if (process.env.PANEL_HN_NET_ISOLATED !== '1') {
     console.error('panel-hn: refusing to run outside hn/net-sandbox.sh');
     process.exit(1);
 }
 // 2026-10-20: eight compromised eMudhra intermediates chain to the G3 root.
-// Drop it from Node's trust before any networking, but do NOT enable websites:
-// Electron/Chromium's independent verifier still needs real-chain testing.
+// Drop it from Node's trust before any networking. Offline synthetic-chain
+// tests exercise both TLS paths; live connector/remote-window review is separate.
 try {
     removeCompromisedNodeRoot();
 } catch {
     console.error('panel-hn: online backend paused: could not constrain CA trust');
     process.exit(1);
 }
-console.error('panel-hn: online backend paused pending Chromium CA review');
+console.error('panel-hn: online backend paused pending remote-window and fetch review');
 process.exit(1);
 
 // No external asset server, remote app URL, RPC listener, or debugging port.
@@ -85,15 +86,11 @@ async function run(): Promise<void> {
         }
     }
     const ipc = new SafeIPC(browser);
-    new FetchProvider(ipc, browser);
+    registerAnonymousFetch(ipc);
     registerRemoteWindows(ipc);
     ipcMain.handle('PanelHN::Fetch', async (event, payload) => {
         if (!isTrustedSender(event, browser)) throw new Error('untrusted IPC sender');
-        if (typeof payload?.url !== 'string' || payload.url.length > 4096) throw new Error('invalid URL');
-        const uri = new URL(payload.url);
-        if (!['http:', 'https:'].includes(uri.protocol) || uri.username || uri.password) {
-            throw new Error('unsupported URL');
-        }
+        const uri = websiteURL(payload?.url);
         if (!['GET', 'POST', 'HEAD'].includes(payload.method)
             || !Array.isArray(payload.headers) || payload.headers.length > 80
             || typeof payload.body !== 'string' || payload.body.length > 2_800_000) {
@@ -107,12 +104,11 @@ async function run(): Promise<void> {
             const key = entry[0].replace(/^x-fetchapi-/i, '').toLowerCase();
             // Neither browser profile cookies nor upstream connector credentials
             // are sent by the anonymous bridge.
-            if (['cookie', 'authorization', 'proxy-authorization', 'host', 'origin',
-                'referer', 'sec-fetch-site', 'sec-fetch-mode', 'sec-fetch-dest'].includes(key)) {
-                if (key === 'referer' && /^https?:\/\//i.test(entry[1])) headers.set('referer', entry[1]);
-                continue;
+            if (key === 'referer') {
+                headers.set('referer', websiteURL(entry[1]).href);
+            } else if (safeHeaderName(entry[0])) {
+                headers.set(key, entry[1]);
             }
-            headers.set(key, entry[1]);
         }
         const abort = new AbortController();
         const timer = setTimeout(() => abort.abort(), 30_000);
@@ -151,50 +147,31 @@ async function run(): Promise<void> {
     input.on('line', line => {
         queue = queue.then(async () => {
             let id: unknown = null;
-            let panelRequest = false;
             try {
                 if (line.length > 16_384) throw new Error('oversized request');
                 const request = JSON.parse(line);
                 id = typeof request.id === 'number' && Number.isSafeInteger(request.id) ? request.id : null;
                 let operation: string;
-                panelRequest = ['sources-panel', 'search-panel', 'chapters-panel'].includes(request.op);
-                if (request.op === 'sources' || request.op === 'sources-panel') {
+                if (request.op === 'sources-panel') {
                     operation = 'globalThis.panelHN.sources()';
                 } else if (request.op === 'search-panel'
                     && typeof request.source === 'string' && /^[a-z0-9_-]{1,80}$/.test(request.source)) {
                     const query = decodeField(request.queryB64, 480);
                     if ([...query].length < 2 || [...query].length > 120) throw new Error('invalid search');
                     operation = `globalThis.panelHN.search(${JSON.stringify(request.source)},${JSON.stringify(query)})`;
-                } else if (request.op === 'search'
-                    && typeof request.source === 'string' && /^[a-z0-9_-]{1,80}$/.test(request.source)
-                    && typeof request.query === 'string' && request.query.length >= 2 && request.query.length <= 120) {
-                    operation = `globalThis.panelHN.search(${JSON.stringify(request.source)},${JSON.stringify(request.query)})`;
                 } else if (request.op === 'chapters-panel'
                     && typeof request.source === 'string' && /^[a-z0-9_-]{1,80}$/.test(request.source)) {
                     const mangaId = decodeField(request.mangaIdB64, 1024);
                     const mangaTitle = decodeField(request.mangaTitleB64, 1024);
                     if (!mangaId || !mangaTitle) throw new Error('invalid chapter request');
                     operation = `globalThis.panelHN.chapters(${JSON.stringify(request.source)},${JSON.stringify(mangaId)},${JSON.stringify(mangaTitle)})`;
-                } else if (request.op === 'chapters'
-                    && typeof request.source === 'string' && /^[a-z0-9_-]{1,80}$/.test(request.source)
-                    && typeof request.mangaId === 'string' && request.mangaId.length > 0 && request.mangaId.length <= 1024
-                    && typeof request.mangaTitle === 'string' && request.mangaTitle.length > 0 && request.mangaTitle.length <= 1024) {
-                    operation = `globalThis.panelHN.chapters(${JSON.stringify(request.source)},${JSON.stringify(request.mangaId)},${JSON.stringify(request.mangaTitle)})`;
                 } else throw new Error('unknown or invalid operation');
                 const results = await browser.executeJavaScript(operation);
-                if (panelRequest) {
-                    process.stdout.write(encodeItems(id, results));
-                } else {
-                    process.stdout.write(JSON.stringify({ id, results }) + '\n');
-                }
+                process.stdout.write(encodeItems(id, results));
             } catch {
                 // Connector exceptions may contain URLs, credentials or page data;
                 // never print them into Panel's log or forward them to the TUI.
-                if (panelRequest) {
-                    process.stdout.write(`${id ?? 0}\terror\n`);
-                } else {
-                    process.stdout.write(JSON.stringify({ id, error: 'request failed' }) + '\n');
-                }
+                process.stdout.write(`${id ?? 0}\terror\n`);
             }
         });
     });

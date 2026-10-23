@@ -29,8 +29,15 @@ intermediate certificates or establish that website content is safe.**
 
 An independent fail-closed gate still prevents the online bridge from starting,
 including from the TUI. `hn/test-backend.sh` verifies this without visiting a
-site. Review the cross-origin fetch, redirects and remote-window boundaries
-before even considering narrow live metadata tests; do not add downloads based
+site. The offline review removed upstream's cookie-reading fetch controller,
+limits the private fetch bridge to anonymous requests with manual redirects,
+and restricts remote-window redirects/navigations to the requested origin.
+Private URL literals and unsafe extra headers are rejected or removed. The
+namespace firewall remains essential for DNS names resolving to private IPs.
+Remote windows are capped at three; loads and scripts have deadlines, but
+renderer memory and returned script data still need review. Validate the
+boundaries with real Electron navigation/IPC tests before narrow live metadata
+tests; do not add downloads based
 on these certificate tests alone. The TUI only starts the backend on an explicit
 Search action, uses the namespaced launcher, bounds and sanitizes metadata
 replies, and cancels the child on exit. See [certifi advisory](https://github.com/advisories/GHSA-6q48-6c7w-9gw2)
@@ -55,9 +62,12 @@ Requirements before enabling the backend:
   only a private parent/child JSON-lines pipe to Panel. No listening network port.
   The bridge validates and limits requests, accepts IPC only from its local
   top-level renderer (not untrusted iframes), rejects browser permissions, and
-  does not log connector errors (which can contain site data). Anonymous
-  cross-origin fetches use a bounded IPC bridge with cookies and authorization
-  stripped; connectors requiring account login or browser automation may fail.
+  does not log connector errors (which can contain site data). Upstream's
+  cookie-reading FetchProvider is replaced with empty cookie responses;
+  no browser cookie jar is queried. Anonymous cross-origin fetches use a
+  bounded IPC bridge with cookies and authorization stripped. The stdin pipe
+  accepts only bounded, encoded source/title/chapter metadata operations;
+  connectors requiring account login or browser automation may fail.
 - Sandbox pages from websites. Allow requested website network access but never
   mount Panel's SQLite database, manga library, SSH keys, or browser profiles
   into the browsing process. `hn/sandbox.sh` alone does **not** restrict network

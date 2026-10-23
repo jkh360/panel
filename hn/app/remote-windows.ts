@@ -4,12 +4,28 @@ import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import type { IPC } from '../../vendor/haruneko/app/electron/src/ipc/InterProcessCommunication';
 import { Channels } from '../../vendor/haruneko/app/electron/src/ipc/InterProcessCommunicationChannels';
+import { remoteHeaders, sameOriginWebsite, websiteURL } from './net-policy.mjs';
 
 // Unlike upstream's controller, never accept renderer-supplied webPreferences
 // or expose arbitrary existing BrowserWindows by ID. The caller is restricted
 // to Panel's trusted engine renderer by SafeIPC in main.ts.
+async function bounded<T>(win: BrowserWindow, operation: Promise<T>, ms: number): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+            if (!win.isDestroyed()) win.destroy();
+            reject(new Error('remote browser timeout'));
+        }, ms);
+    });
+    try {
+        return await Promise.race([operation, deadline]);
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
 export function registerRemoteWindows(ipc: IPC): void {
-    const windows = new Map<number, { window: BrowserWindow; preload?: string }>();
+    const windows = new Map<number, { window: BrowserWindow; preload?: string; allowedOrigin?: string; loading?: boolean }>();
     const get = (id: number): BrowserWindow => {
         const win = windows.get(id)?.window;
         if (!win || win.isDestroyed()) throw new Error('unknown browser window');
@@ -42,9 +58,13 @@ export function registerRemoteWindows(ipc: IPC): void {
         win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
         win.webContents.session.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false));
         win.webContents.session.setPermissionCheckHandler(() => false);
-        win.webContents.on('will-navigate', (event, url) => {
-            if (!/^https?:\/\//i.test(url)) event.preventDefault();
-        });
+        const allowNavigation = (event: Electron.Event, url: string) => {
+            if (!sameOriginWebsite(url, windows.get(win.id)?.allowedOrigin)) event.preventDefault();
+        };
+        win.webContents.on('will-navigate', allowNavigation);
+        // A main-frame redirect must not carry loadURL's connector headers to
+        // an unrelated origin (including a local service or a new web domain).
+        win.webContents.on('will-redirect', allowNavigation);
         win.webContents.on('did-start-navigation', (_event, url, isMainFrame, isSameDocument) => {
             ipc.Send(Channels.RemoteBrowserWindowController.OnBeforeNavigate, win.id, url, isMainFrame, isSameDocument);
         });
@@ -57,14 +77,29 @@ export function registerRemoteWindows(ipc: IPC): void {
         return win.id;
     });
     ipc.Handle(Channels.RemoteBrowserWindowController.LoadURL, async (id: number, url: string, options: string) => {
-        if (!/^https?:\/\//i.test(url)) throw new Error('unsupported website URL');
+        const uri = websiteURL(url);
+        if (typeof options !== 'string' || options.length > 16_384) throw new Error('invalid load options');
         const requested = JSON.parse(options);
-        await get(id).loadURL(url, {
+        if (!requested || typeof requested !== 'object' || Array.isArray(requested)) {
+            throw new Error('invalid load options');
+        }
+        const entry = windows.get(id);
+        if (!entry || entry.window.isDestroyed()) throw new Error('unknown browser window');
+        if (entry.loading) throw new Error('browser window busy');
+        const loadOptions = {
             userAgent: typeof requested.userAgent === 'string' ? requested.userAgent.slice(0, 512) : undefined,
             httpReferrer: typeof requested.httpReferrer === 'string' && /^https?:\/\//i.test(requested.httpReferrer)
-                ? requested.httpReferrer.slice(0, 2048) : undefined,
-            extraHeaders: typeof requested.extraHeaders === 'string' ? requested.extraHeaders.slice(0, 8192) : undefined,
-        });
+                ? websiteURL(requested.httpReferrer).href.slice(0, 2048) : undefined,
+            extraHeaders: remoteHeaders(requested.extraHeaders),
+        };
+        // Do not change the redirect origin beneath an in-flight load.
+        entry.loading = true;
+        entry.allowedOrigin = uri.origin;
+        try {
+            await bounded(entry.window, entry.window.loadURL(uri.href, loadOptions), 30_000);
+        } finally {
+            entry.loading = false;
+        }
     });
     ipc.Handle(Channels.RemoteBrowserWindowController.CloseWindow, async (id: number) => get(id).destroy());
     ipc.Handle(Channels.RemoteBrowserWindowController.SetVisibility, async (_id: number, _show: boolean) => {
@@ -72,7 +107,8 @@ export function registerRemoteWindows(ipc: IPC): void {
     });
     ipc.Handle(Channels.RemoteBrowserWindowController.ExecuteScript, async (id: number, script: string) => {
         if (typeof script !== 'string' || script.length > 262_144) throw new Error('script limit');
-        return get(id).webContents.executeJavaScript(script, true);
+        const win = get(id);
+        return bounded(win, win.webContents.executeJavaScript(script, true), 15_000);
     });
     ipc.Handle(Channels.RemoteBrowserWindowController.SendDebugCommand, async () => {
         throw new Error('remote debugging disabled');
