@@ -35,6 +35,8 @@
 !/hn/app/node-ca.test.mjs
 !/hn/app/metadata-wire.mjs
 !/hn/app/metadata-wire.test.mjs
+!/hn/app/ipc-policy.mjs
+!/hn/app/ipc-policy.test.mjs
 !/hn/app/remote-windows.ts
 !/hn/app/preload.ts
 !/hn/app/package.json

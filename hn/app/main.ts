@@ -9,6 +9,7 @@ import { registerRemoteWindows } from './remote-windows';
 import { certificateDecision } from './ca-policy.mjs';
 import { removeCompromisedNodeRoot } from './node-ca.mjs';
 import { decodeField, encodeItems } from './metadata-wire.mjs';
+import { isTrustedSender } from './ipc-policy.mjs';
 
 if (process.env.PANEL_HN_NET_ISOLATED !== '1') {
     console.error('panel-hn: refusing to run outside hn/net-sandbox.sh');
@@ -78,7 +79,7 @@ async function run(): Promise<void> {
             channel: string, callback: (...parameters: TParameters) => TReturn | PromiseLike<TReturn>
         ): void {
             ipcMain.handle(channel, (event, ...args: TParameters) => {
-                if (event.sender !== browser) throw new Error('untrusted IPC sender');
+                if (!isTrustedSender(event, browser)) throw new Error('untrusted IPC sender');
                 return callback(...args);
             });
         }
@@ -87,7 +88,7 @@ async function run(): Promise<void> {
     new FetchProvider(ipc, browser);
     registerRemoteWindows(ipc);
     ipcMain.handle('PanelHN::Fetch', async (event, payload) => {
-        if (event.sender !== browser) throw new Error('untrusted IPC sender');
+        if (!isTrustedSender(event, browser)) throw new Error('untrusted IPC sender');
         if (typeof payload?.url !== 'string' || payload.url.length > 4096) throw new Error('invalid URL');
         const uri = new URL(payload.url);
         if (!['http:', 'https:'].includes(uri.protocol) || uri.username || uri.password) {

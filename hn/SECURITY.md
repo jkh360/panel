@@ -53,8 +53,9 @@ Requirements before enabling the backend:
   browser profiles, cookies, credentials, or home directory. Do not import cookies.
 - Disable upstream RPC, remote debugging, and unnecessary file access; expose
   only a private parent/child JSON-lines pipe to Panel. No listening network port.
-  The bridge validates and limits requests, rejects browser permissions,
-  and does not log connector errors (which can contain site data). Anonymous
+  The bridge validates and limits requests, accepts IPC only from its local
+  top-level renderer (not untrusted iframes), rejects browser permissions, and
+  does not log connector errors (which can contain site data). Anonymous
   cross-origin fetches use a bounded IPC bridge with cookies and authorization
   stripped; connectors requiring account login or browser automation may fail.
 - Sandbox pages from websites. Allow requested website network access but never
