@@ -18,6 +18,7 @@
 !/hn/net-sandbox.sh
 !/hn/test-sandbox.sh
 !/hn/test-backend.sh
+!/hn/test-certificates.sh
 !/hn/web/
 !/hn/web/index.html
 !/hn/web/entry.ts
@@ -26,6 +27,8 @@
 !/hn/web/no-frontend.ts
 !/hn/app/
 !/hn/app/main.ts
+!/hn/app/certificate-probe.cjs
+!/hn/app/certificate-probe-run.sh
 !/hn/app/ca-policy.mjs
 !/hn/app/ca-policy.test.mjs
 !/hn/app/node-ca.mjs

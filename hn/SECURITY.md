@@ -10,19 +10,30 @@ and Panel's private Electron bridge with Node.js 24, excluding the upstream GUI
 and Electron entry. Earlier isolated tests listed 826 connectors and completed
 MangaDex search and chapter listing; no other site has been verified.
 
-**Online testing is paused as of 2026-10-21.** The compromised emSign ECC Root
-CA - G3 remains in the host Node default trust store (rechecked 2026-10-22).
-The bridge removes it from its own Node trust before any networking, and a
-separate Chromium certificate policy rejects chains identifying that issuer
-without overriding other certificate failures. These policies have **offline
-unit tests only**; Chromium's real-chain behavior has not been verified.
-An independent fail-closed gate still prevents the bridge from starting,
-including when opened from the TUI. `hn/test-backend.sh` verifies this without
-visiting a site. The TUI only starts the backend on an explicit Search action,
-uses the namespaced sandbox launcher, bounds and sanitizes metadata replies,
-and cancels the child on exit. Do not run live
-website tests, add downloads, or remove the gate until both trust paths are
-verified end-to-end. See [certifi advisory](https://github.com/advisories/GHSA-6q48-6c7w-9gw2)
+**Online testing remains paused.** The compromised emSign ECC Root CA - G3
+is still in the host Node default trust store. The bridge removes it from its
+own Node trust before any networking. Its separate Chromium policy rejects
+chains identifying that issuer without overriding other certificate failures.
+
+On 2026-10-23, `hn/test-certificates.sh` exercised the **real Electron/Node
+TLS paths inside the production filesystem/browser sandbox**, in a network
+namespace with loopback but **no external route**. Fresh, synthetic X.509
+chains bearing the affected root's name were deliberately trusted only in a
+temporary test profile. A fresh-origin Node `fetch` rejected them after the
+bridge's root removal; both Electron sessions reported a valid original chain
+and rejected the direct and intermediate-signed cases. An unaffected trusted
+chain loaded; a hostname mismatch remained rejected. This verifies the
+certificate-policy mechanism end-to-end without visiting a website or
+installing any CA into the host. **It does not test the real compromised
+intermediate certificates or establish that website content is safe.**
+
+An independent fail-closed gate still prevents the online bridge from starting,
+including from the TUI. `hn/test-backend.sh` verifies this without visiting a
+site. Review the cross-origin fetch, redirects and remote-window boundaries
+before even considering narrow live metadata tests; do not add downloads based
+on these certificate tests alone. The TUI only starts the backend on an explicit
+Search action, uses the namespaced launcher, bounds and sanitizes metadata
+replies, and cancels the child on exit. See [certifi advisory](https://github.com/advisories/GHSA-6q48-6c7w-9gw2)
 and the [PHP RCE advisory](https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w).
 The PHP issue affects website servers, not Panel's client, but compromised
 servers can supply hostile pages and archives.
