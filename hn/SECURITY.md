@@ -5,10 +5,10 @@ The upstream Unlicense covers its code, **not** content served by websites.
 This experimental branch wires a metadata-only source-catalog, title-search,
 and chapter-listing prototype to the TUI (`s` or `/` in the library). Website
 access is disabled by default and requires `PANEL_HN_ENABLE_METADATA=1` plus
-an explicit Search action. It has **no** download feature. `hn/build.sh` compiles the pinned upstream engine/connectors
-and Panel's private Electron bridge with Node.js 24, excluding the upstream GUI
-and Electron entry. Earlier isolated tests listed 826 connectors and completed
-MangaDex search and chapter listing; no other site has been verified.
+an explicit Search action. It has **no** download feature. `hn/build.sh` compiles
+the pinned upstream engine/connectors and Panel's private Electron bridge with
+Node.js 24, excluding the upstream GUI and Electron entry. Listing 826
+connectors does not establish that their websites work.
 
 **Opt-in metadata access only.** The affected emSign ECC Root CA - G3
 is still in the host Node default trust store. The bridge removes it from its
@@ -39,12 +39,16 @@ after Electron deserializes them. `hn/test-boundaries.sh` exercised actual
 Electron IPC sender frames, same-origin redirects and blocked cross-origin
 redirects/navigations without an external route. `hn/test-metadata-offline.sh`
 started the opted-in bridge without a route and listed 826 connector definitions.
-On 2026-10-23, a single opted-in, isolated MangaDex metadata search returned
-50 title entries; **no images or downloads were requested**. Only MangaDex
-was selected; a connector may make requests to associated hosts. This validates
-that request, not the remaining connectors. Renderer memory and oversized
-data before IPC deserialization remain limitations; do not add downloads based on these
-metadata tests. The TUI only starts the backend on explicit Search, uses the
+On 2026-10-23, the **actual TUI** was driven through MangaDex source selection,
+a live title search, a seven-chapter metadata listing and return to the library.
+Separate isolated live requests confirmed official MANGA Plus by Shueisha
+returned 32 matching titles and two chapter entries for each of two tested
+titles. Some MangaDex titles returned zero chapters, which the TUI reports as
+"No results"; that alone does not show whether the website or connector has
+changed. **No images or downloads were requested.** These two connectors are
+not representative of the other 824; associated hosts may be contacted by each
+connector. Renderer memory and oversized data before IPC deserialization remain
+limitations; do not add downloads based on these metadata tests. The TUI only starts the backend on explicit Search, uses the
 namespaced launcher, bounds and sanitizes replies, and cancels the child on exit. See [certifi advisory](https://github.com/advisories/GHSA-6q48-6c7w-9gw2)
 and the [PHP RCE advisory](https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w).
 The PHP issue affects website servers, not Panel's client, but compromised
