@@ -18,6 +18,13 @@
               pkg-config
               rustc
               rustfmt
+              nodejs_24
+              electron
+              xorg-server
+              bubblewrap
+              slirp4netns
+              iptables
+              util-linux
             ];
             buildInputs = with pkgs; [ gtk4 ];
           };
