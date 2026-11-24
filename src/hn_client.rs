@@ -1,10 +1,10 @@
-//! Experimental metadata-only HaruNeko client. The backend remains behind its
-//! explicit online-metadata opt-in; never launch it outside net-sandbox.sh.
+//! Isolated HaruNeko metadata and chapter-image pipe. Never launch the
+//! backend outside net-sandbox.sh or grant it access to output directories.
 use std::{
     env,
     io::{BufRead, BufReader, Read, Write},
     os::unix::process::CommandExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{self, Child, Command, Stdio},
     sync::{
         Arc, Mutex,
@@ -14,6 +14,7 @@ use std::{
     thread,
 };
 
+use crate::hn_download::CbzOutput;
 use anyhow::{Result, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 
@@ -34,16 +35,44 @@ pub enum Request {
         id: String,
         title: String,
     },
+    Download {
+        source: Item,
+        manga: Item,
+        chapter: Item,
+        directory: PathBuf,
+    },
+    DownloadAll {
+        source: Item,
+        manga: Item,
+        chapters: Vec<Item>,
+        directory: PathBuf,
+    },
     Stop,
 }
 
 pub enum Failure {
     Unavailable,
     Connector,
+    Download,
 }
 
 pub enum Event {
     Loaded(Vec<Item>),
+    DownloadProgress {
+        done: usize,
+        total: usize,
+    },
+    Downloaded(PathBuf),
+    BatchProgress {
+        done: usize,
+        total: usize,
+        saved: usize,
+        skipped: usize,
+    },
+    BatchFinished {
+        saved: usize,
+        skipped: usize,
+    },
     Failed(Failure),
 }
 
@@ -153,6 +182,74 @@ fn run(
             if cancel.load(Ordering::Relaxed) || matches!(request, Request::Stop) {
                 break;
             }
+            if let Request::DownloadAll {
+                source,
+                manga,
+                chapters,
+                directory,
+            } = &request
+            {
+                if chapters.len() > 2_000 || chapters.is_empty() {
+                    let _ = events.send(Event::Failed(Failure::Download));
+                    break;
+                }
+                let mut saved = 0;
+                let mut skipped = 0;
+                for (index, chapter) in chapters.iter().enumerate() {
+                    if cancel.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if download_chapter(
+                        &mut input,
+                        &mut output,
+                        (source, manga, chapter, directory),
+                        events,
+                        cancel,
+                    )
+                    .is_ok()
+                    {
+                        saved += 1;
+                    } else {
+                        skipped += 1;
+                    }
+                    let _ = events.send(Event::BatchProgress {
+                        done: index + 1,
+                        total: chapters.len(),
+                        saved,
+                        skipped,
+                    });
+                }
+                if !cancel.load(Ordering::Relaxed) {
+                    let _ = events.send(Event::BatchFinished { saved, skipped });
+                }
+                continue;
+            }
+            if let Request::Download {
+                source,
+                manga,
+                chapter,
+                directory,
+            } = &request
+            {
+                match download_chapter(
+                    &mut input,
+                    &mut output,
+                    (source, manga, chapter, directory),
+                    events,
+                    cancel,
+                ) {
+                    Ok(path) => {
+                        if events.send(Event::Downloaded(path)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        let _ = events.send(Event::Failed(Failure::Download));
+                        break;
+                    }
+                }
+                continue;
+            }
             let line = encode_request(&request)?;
             input.write_all(line.as_bytes())?;
             input.write_all(b"\n")?;
@@ -229,8 +326,102 @@ fn encode_request(request: &Request) -> Result<String> {
                 STANDARD.encode(title)
             ))
         }
-        Request::Stop => bail!("not a backend request"),
+        Request::Download { .. } | Request::DownloadAll { .. } | Request::Stop => {
+            bail!("not a metadata request")
+        }
     }
+}
+
+fn write_command(input: &mut impl Write, request: &str) -> Result<()> {
+    input.write_all(request.as_bytes())?;
+    input.write_all(b"\n")?;
+    input.flush()?;
+    Ok(())
+}
+
+fn read_download_line(input: &mut impl BufRead, limit: u64) -> Result<String> {
+    let mut bytes = Vec::new();
+    let read = input.take(limit + 1).read_until(b'\n', &mut bytes)?;
+    ensure!(
+        read > 0 && read as u64 <= limit && bytes.last() == Some(&b'\n'),
+        "invalid download reply"
+    );
+    Ok(String::from_utf8(bytes)?.trim_end_matches('\n').to_owned())
+}
+
+fn download_chapter(
+    input: &mut impl Write,
+    output: &mut impl BufRead,
+    (source, manga, chapter, directory): (&Item, &Item, &Item, &Path),
+    events: &Sender<Event>,
+    cancel: &AtomicBool,
+) -> Result<PathBuf> {
+    source_id(&source.id)?;
+    ensure!(
+        !manga.id.is_empty()
+            && manga.id.len() <= 1024
+            && manga.title.len() <= 1024
+            && !chapter.id.is_empty()
+            && chapter.id.len() <= 1024,
+        "invalid chapter"
+    );
+    write_command(
+        input,
+        &format!(
+            r#"{{"id":1,"op":"prepare-download-panel","source":"{}","mangaIdB64":"{}","mangaTitleB64":"{}","chapterIdB64":"{}"}}"#,
+            source.id,
+            STANDARD.encode(&manga.id),
+            STANDARD.encode(&manga.title),
+            STANDARD.encode(&chapter.id),
+        ),
+    )?;
+    let prepared = read_download_line(output, 256)?;
+    let parts: Vec<_> = prepared.split('\t').collect();
+    ensure!(
+        parts.len() == 4 && parts[0] == "1" && parts[1] == "prepared",
+        "backend request failed"
+    );
+    let token = parts[2];
+    ensure!(
+        token.len() == 36 && token.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'),
+        "invalid token"
+    );
+    let count: usize = parts[3].parse()?;
+    ensure!((1..=300).contains(&count), "invalid page count");
+    let mut archive = CbzOutput::new(
+        directory,
+        &source.id,
+        &manga.title,
+        &chapter.title,
+        &chapter.id,
+    )?;
+    for index in 0..count {
+        ensure!(!cancel.load(Ordering::Relaxed), "download cancelled");
+        write_command(
+            input,
+            &format!(r#"{{"id":1,"op":"fetch-page-panel","token":"{token}","index":{index}}}"#,),
+        )?;
+        let reply = read_download_line(output, 16_000_040)?;
+        let encoded = reply
+            .strip_prefix("1\tpage\t")
+            .ok_or_else(|| anyhow::anyhow!("backend request failed"))?;
+        ensure!(encoded.len() <= 16_000_000, "oversized image");
+        let bytes = STANDARD.decode(encoded)?;
+        archive.add_page(index, &bytes)?;
+        let _ = events.send(Event::DownloadProgress {
+            done: index + 1,
+            total: count,
+        });
+    }
+    write_command(
+        input,
+        &format!(r#"{{"id":1,"op":"finish-download-panel","token":"{token}"}}"#,),
+    )?;
+    ensure!(
+        read_download_line(output, 128)? == "1\tdone",
+        "backend request failed"
+    );
+    archive.finish()
 }
 
 fn safe_text(text: &str) -> String {
@@ -276,9 +467,69 @@ fn read_reply(input: &mut impl BufRead) -> Result<Vec<Item>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Item, Request, encode_request, read_reply};
+    use super::{Item, Request, download_chapter, encode_request, read_reply};
     use base64::{Engine as _, engine::general_purpose::STANDARD};
-    use std::io::Cursor;
+    use std::{
+        fs,
+        io::Cursor,
+        sync::{atomic::AtomicBool, mpsc},
+    };
+
+    #[test]
+    fn chapter_download_writes_a_complete_cbz_from_bounded_pipe() {
+        let dir = std::env::temp_dir().join(format!("panel-worker-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir(&dir).unwrap();
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgb8(2, 2)
+            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let token = "00000000-0000-4000-8000-000000000001";
+        let reply = format!(
+            "1\tprepared\t{token}\t1\n1\tpage\t{}\n1\tdone\n",
+            STANDARD.encode(png)
+        );
+        let (events, progress) = mpsc::channel();
+        let mut input = Vec::new();
+        let mut output = Cursor::new(reply);
+        let path = download_chapter(
+            &mut input,
+            &mut output,
+            (
+                &Item {
+                    id: "source".into(),
+                    title: "Source".into(),
+                },
+                &Item {
+                    id: "manga".into(),
+                    title: "Manga".into(),
+                },
+                &Item {
+                    id: "chapter".into(),
+                    title: "Chapter".into(),
+                },
+                &dir,
+            ),
+            &events,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(matches!(
+            progress.try_recv().unwrap(),
+            super::Event::DownloadProgress { done: 1, total: 1 }
+        ));
+        let wire = String::from_utf8(input).unwrap();
+        assert!(wire.contains("prepare-download-panel"));
+        assert!(wire.contains("fetch-page-panel"));
+        assert!(wire.contains("finish-download-panel"));
+        assert_eq!(
+            zip::ZipArchive::new(fs::File::open(&path).unwrap())
+                .unwrap()
+                .len(),
+            1
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn backend_wire_round_trip_and_bounds() {

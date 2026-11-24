@@ -8,7 +8,7 @@ import { registerAnonymousFetch } from './anonymous-fetch';
 import { registerRemoteWindows } from './remote-windows';
 import { certificateDecision } from './ca-policy.mjs';
 import { removeCompromisedNodeRoot } from './node-ca.mjs';
-import { decodeField, encodeItems } from './metadata-wire.mjs';
+import { decodeField, encodeDownloadReply, encodeItems } from './metadata-wire.mjs';
 import { isTrustedSender } from './ipc-policy.mjs';
 import { safeHeaderName, websiteURL } from './net-policy.mjs';
 
@@ -154,6 +154,7 @@ async function run(): Promise<void> {
                 const request = JSON.parse(line);
                 id = typeof request.id === 'number' && Number.isSafeInteger(request.id) ? request.id : null;
                 let operation: string;
+                let responseKind = 'items';
                 if (request.op === 'sources-panel') {
                     operation = 'globalThis.panelHN.sources()';
                 } else if (request.op === 'search-panel'
@@ -167,9 +168,27 @@ async function run(): Promise<void> {
                     const mangaTitle = decodeField(request.mangaTitleB64, 1024);
                     if (!mangaId || !mangaTitle) throw new Error('invalid chapter request');
                     operation = `globalThis.panelHN.chapters(${JSON.stringify(request.source)},${JSON.stringify(mangaId)},${JSON.stringify(mangaTitle)})`;
+                } else if (request.op === 'prepare-download-panel'
+                    && typeof request.source === 'string' && /^[a-z0-9_-]{1,80}$/.test(request.source)) {
+                    const mangaId = decodeField(request.mangaIdB64, 1024);
+                    const mangaTitle = decodeField(request.mangaTitleB64, 1024);
+                    const chapterId = decodeField(request.chapterIdB64, 1024);
+                    if (!mangaId || !mangaTitle || !chapterId) throw new Error('invalid chapter');
+                    operation = `globalThis.panelHN.prepareDownload(${JSON.stringify(request.source)},${JSON.stringify(mangaId)},${JSON.stringify(mangaTitle)},${JSON.stringify(chapterId)})`;
+                    responseKind = 'prepared';
+                } else if (request.op === 'fetch-page-panel'
+                    && typeof request.token === 'string' && /^[a-f0-9-]{36}$/.test(request.token)
+                    && Number.isInteger(request.index) && request.index >= 0 && request.index < 300) {
+                    operation = `globalThis.panelHN.fetchPage(${JSON.stringify(request.token)},${request.index})`;
+                    responseKind = 'page';
+                } else if (request.op === 'finish-download-panel'
+                    && typeof request.token === 'string' && /^[a-f0-9-]{36}$/.test(request.token)) {
+                    operation = `globalThis.panelHN.finishDownload(${JSON.stringify(request.token)})`;
+                    responseKind = 'done';
                 } else throw new Error('unknown or invalid operation');
                 const results = await browser.executeJavaScript(operation);
-                process.stdout.write(encodeItems(id, results));
+                process.stdout.write(responseKind === 'items' ? encodeItems(id, results)
+                    : encodeDownloadReply(id, responseKind, results));
             } catch {
                 // Connector exceptions may contain URLs, credentials or page data;
                 // never print them into Panel's log or forward them to the TUI.

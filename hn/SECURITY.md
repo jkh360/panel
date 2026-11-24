@@ -5,7 +5,9 @@ The upstream Unlicense covers its code, **not** content served by websites.
 This experimental branch wires a metadata-only source-catalog, title-search,
 and chapter-listing prototype to the TUI (`s` or `/` in the library). Website
 access is disabled by default and requires `PANEL_HN_ENABLE_METADATA=1` plus
-an explicit Search action. It has **no** download feature. `hn/build.sh` compiles
+an explicit Search action. `d` requests a complete chapter CBZ; `D` queues
+all listed chapters in that title (up to the 2,000 metadata cap). Browsing alone
+never starts a download. `hn/build.sh` compiles
 the pinned upstream engine/connectors and Panel's private Electron bridge with
 Node.js 24, excluding the upstream GUI and Electron entry. Listing 826
 connectors does not establish that their websites work.
@@ -45,11 +47,25 @@ Separate isolated live requests confirmed official MANGA Plus by Shueisha
 returned 32 matching titles and two chapter entries for each of two tested
 titles. Some MangaDex titles returned zero chapters, which the TUI reports as
 "No results"; that alone does not show whether the website or connector has
-changed. **No images or downloads were requested.** These two connectors are
+changed. Those October checks requested no images. These two connectors are
 not representative of the other 824; associated hosts may be contacted by each
 connector. Renderer memory and oversized data before IPC deserialization remain
-limitations; do not add downloads based on these metadata tests. The TUI only starts the backend on explicit Search, uses the
-namespaced launcher, bounds and sanitizes replies, and cancels the child on exit. See [certifi advisory](https://github.com/advisories/GHSA-6q48-6c7w-9gw2)
+limitations. Chapter downloads stream one bounded page at a time through the
+private pipe; only Panel (outside the backend sandbox) writes files, under the
+current library folder's `Panel Downloads/` directory. Panel checks decoded
+JPEG/PNG/WebP images, limits pages and bytes, and publishes a CBZ only after all
+pages pass. A failed or cancelled chapter leaves no final CBZ; completed
+chapters in a cancelled batch remain available, and existing CBZs are never
+overwritten. The writer is tested with synthetic images. On 2026-11-24, the
+**official MANGA Plus** connector saved a complete 23-page chapter through
+the actual TUI. A subsequent `D` batch saved three valid CBZs with 23, 25 and
+55 ordered pages. ZIP integrity was checked and all test output was removed.
+Panel's anonymous adapter skips upstream's MANGA Plus login-token lookup in a
+remote window: the isolated profile has no login token and its public API
+works without one. This does not bypass authentication or certificate checks.
+Some other official chapters were unavailable; the remaining connectors are
+not yet verified for downloads. The TUI starts the backend only on explicit
+Search, sanitizes replies, and cancels the child on exit. See [certifi advisory](https://github.com/advisories/GHSA-6q48-6c7w-9gw2)
 and the [PHP RCE advisory](https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w).
 The PHP issue affects website servers, not Panel's client, but compromised
 servers can supply hostile pages and archives.
@@ -88,8 +104,11 @@ Security boundary for the opt-in backend:
   except its DNS resolver. IPv6 has no external route. The browser runs as a
   non-root user under an isolated Xvfb, not on the user's desktop display.
   Its network policy is experimental, not a guarantee that site scripts are safe.
-- Confirm downloaded data are images, bound their size and count, write CBZ
-  files atomically, and prevent traversal or overwrite through remote filenames.
+- Downloaded data must decode as JPEG, PNG or WebP; each page is capped at
+  12 MB, each chapter at 300 pages / 512 MB, and dimensions are bounded.
+  Site-supplied filenames are never used as archive paths. Output names are
+  sanitized, and the resulting CBZ is published atomically without replacing
+  existing files. The isolated browser has no mount of the destination.
 - Run only when a user explicitly opens Search. Keep the reader offline.
 
 Website connectors may require further privileges or stop working. A connector

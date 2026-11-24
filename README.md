@@ -27,13 +27,20 @@ Run `panel` to browse from your home directory, or `panel book.cbz` to open a bo
 
 In whole-page mode, `j` and `k` also move between pages. Page direction follows right-to-left manga reading order.
 
-On `panel-hn`, Search is a read-only source/title/chapter browser. Website
-access is **disabled by default**; after building with `sh hn/build.sh`, opt in
+On `panel-hn`, Search browses sources, titles and chapters. Press **`f`** on the
+sources screen to filter by name. Press **`d`** on a chapter to fetch all pages,
+or **`D`** to queue every chapter shown for that title. Complete CBZs are saved
+under `Panel Downloads/<source>/<manga>/` in the current library directory.
+Website access is **disabled by default**;
+after building with `sh hn/build.sh`, opt in
 with `PANEL_HN_ENABLE_METADATA=1 cargo run --release` (Electron, Xvfb,
 Bubblewrap, slirp4netns, iptables and user namespaces required). The browser
 uses a fresh isolated profile and does not read your existing cookies or files.
-Connectors can fail, and loaded sources are not verified websites. There are
-**no chapter downloads**. See [`hn/SECURITY.md`](hn/SECURITY.md) before opting
+Connectors can fail, and loaded sources are not verified websites. CBZs are
+published only after every page decodes successfully; existing books are never
+overwritten. A batch continues past unavailable or already-saved chapters;
+Esc stops further downloads without deleting completed CBZs. See
+[`hn/SECURITY.md`](hn/SECURITY.md) before opting
 in. Stable `master` does not contain this backend.
 
 GPL-3.0-only.

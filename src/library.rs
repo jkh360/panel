@@ -394,7 +394,7 @@ impl Library {
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => return Ok(None),
                 KeyCode::Char('s') | KeyCode::Char('/') => {
-                    if let Err(error) = crate::hn_search::browse(terminal) {
+                    if let Err(error) = crate::hn_search::browse(terminal, &self.directory) {
                         self.notice = Some(format!("Search unavailable: {error}"));
                     }
                 }

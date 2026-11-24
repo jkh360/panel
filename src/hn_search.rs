@@ -1,5 +1,5 @@
-//! Read-only connector, title and chapter browser. No downloads or cookies.
-use std::time::Duration;
+//! Keyboard-first connector browser with explicit local chapter CBZ downloads.
+use std::{path::Path, time::Duration};
 
 use anyhow::Result;
 use crossterm::event::{self, Event as KeyEvent, KeyCode, KeyEventKind, KeyModifiers};
@@ -29,6 +29,9 @@ struct Browser {
     screen: Screen,
     selected: usize,
     sources: Vec<Item>,
+    filtered_sources: Vec<Item>,
+    source_filter: String,
+    filtering: bool,
     titles: Vec<Item>,
     chapters: Vec<Item>,
     source: Option<Item>,
@@ -44,6 +47,9 @@ impl Browser {
             screen: Screen::Sources,
             selected: 0,
             sources: Vec::new(),
+            filtered_sources: Vec::new(),
+            source_filter: String::new(),
+            filtering: false,
             titles: Vec::new(),
             chapters: Vec::new(),
             source: None,
@@ -56,11 +62,25 @@ impl Browser {
 
     fn items(&self) -> &[Item] {
         match self.screen {
-            Screen::Sources => &self.sources,
+            Screen::Sources => &self.filtered_sources,
             Screen::Query => &[],
             Screen::Titles => &self.titles,
             Screen::Chapters => &self.chapters,
         }
+    }
+
+    fn update_source_filter(&mut self) {
+        let needle = self.source_filter.to_lowercase();
+        self.filtered_sources = self
+            .sources
+            .iter()
+            .filter(|source| {
+                source.title.to_lowercase().contains(&needle)
+                    || source.id.to_lowercase().contains(&needle)
+            })
+            .cloned()
+            .collect();
+        self.selected = 0;
     }
 
     fn back(&mut self) -> bool {
@@ -86,8 +106,36 @@ impl Browser {
     }
 
     fn accept(&mut self, event: Event) {
+        if let Event::DownloadProgress { done, total } = event {
+            self.notice = format!("Saving page {done}/{total}… Esc cancels");
+            return;
+        }
+        if let Event::BatchProgress {
+            done,
+            total,
+            saved,
+            skipped,
+        } = event
+        {
+            self.notice =
+                format!("Chapters {done}/{total}: saved {saved}, skipped {skipped} · Esc cancels");
+            return;
+        }
         self.loading = false;
         match event {
+            Event::DownloadProgress { .. } | Event::BatchProgress { .. } => unreachable!(),
+            Event::BatchFinished { saved, skipped } => {
+                self.notice =
+                    format!("Batch finished: {saved} CBZs saved, {skipped} skipped or failed");
+            }
+            Event::Downloaded(path) => {
+                self.notice = format!("Saved: {}", path.display());
+            }
+            Event::Failed(Failure::Download) => {
+                self.notice =
+                    "Download failed (site, image, size limit or disk); reopen Search to retry"
+                        .into();
+            }
             Event::Failed(Failure::Unavailable) => {
                 self.notice = "Online backend unavailable / paused (hn/SECURITY.md)".into();
             }
@@ -102,7 +150,10 @@ impl Browser {
                     String::new()
                 };
                 match self.screen {
-                    Screen::Sources => self.sources = items,
+                    Screen::Sources => {
+                        self.sources = items;
+                        self.update_source_filter();
+                    }
                     Screen::Titles => self.titles = items,
                     Screen::Chapters => self.chapters = items,
                     Screen::Query => {} // Stale replies cannot select a manga.
@@ -137,7 +188,21 @@ impl Browser {
             ),
             rows[0],
         );
-        if self.screen == Screen::Query {
+        if self.screen == Screen::Sources && self.filtering {
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "Filter sources: {}▌\nEnter: select · Esc: clear",
+                    self.source_filter
+                ))
+                .block(
+                    Block::default()
+                        .title(" Source filter ")
+                        .borders(Borders::ALL),
+                )
+                .style(Style::default().fg(FG).bg(BG)),
+                rows[1],
+            );
+        } else if self.screen == Screen::Query {
             frame.render_widget(
                 Paragraph::new(format!(
                     "Source: {}\n\nSearch: {}▌\n\nEnter: search · Esc: sources",
@@ -168,10 +233,9 @@ impl Browser {
         }
         let hint = if self.notice.is_empty() {
             match self.screen {
-                Screen::Chapters => {
-                    "Chapters are metadata only. Downloads disabled. · Esc back · q library"
-                }
+                Screen::Chapters => "d save chapter · D save all chapters · Esc back · q library",
                 Screen::Query => "Type a title · Enter search · Esc back",
+                Screen::Sources => "f or / filter sources · j/k select · Enter open · q library",
                 _ => "j/k select · Enter open · Esc back · q library",
             }
         } else {
@@ -186,7 +250,7 @@ impl Browser {
     }
 }
 
-pub fn browse(terminal: &mut DefaultTerminal) -> Result<()> {
+pub fn browse(terminal: &mut DefaultTerminal, directory: &Path) -> Result<()> {
     let client = Client::start();
     let mut state = Browser::new();
     state.request(&client, Request::Sources);
@@ -218,6 +282,30 @@ pub fn browse(terminal: &mut DefaultTerminal) -> Result<()> {
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             break;
+        }
+        if state.screen == Screen::Sources && state.filtering {
+            match key.code {
+                KeyCode::Esc => {
+                    state.filtering = false;
+                    state.source_filter.clear();
+                    state.update_source_filter();
+                }
+                KeyCode::Enter => state.filtering = false,
+                KeyCode::Backspace => {
+                    state.source_filter.pop();
+                    state.update_source_filter();
+                }
+                KeyCode::Char(c) if !c.is_control() && state.source_filter.chars().count() < 80 => {
+                    state.source_filter.push(c);
+                    state.update_source_filter();
+                }
+                _ => {}
+            }
+            continue;
+        }
+        if state.screen == Screen::Sources && matches!(key.code, KeyCode::Char('f' | '/')) {
+            state.filtering = true;
+            continue;
         }
         if key.code == KeyCode::Esc
             || (key.code == KeyCode::Char('h') && state.screen != Screen::Query)
@@ -257,6 +345,36 @@ pub fn browse(terminal: &mut DefaultTerminal) -> Result<()> {
             continue;
         }
         match key.code {
+            KeyCode::Char('D') if state.screen == Screen::Chapters => {
+                if let (Some(source), Some(manga)) = (state.source.clone(), state.title.clone()) {
+                    state.request(
+                        &client,
+                        Request::DownloadAll {
+                            source,
+                            manga,
+                            chapters: state.chapters.clone(),
+                            directory: directory.to_path_buf(),
+                        },
+                    );
+                }
+            }
+            KeyCode::Char('d') if state.screen == Screen::Chapters => {
+                if let (Some(source), Some(manga), Some(chapter)) = (
+                    state.source.clone(),
+                    state.title.clone(),
+                    state.items().get(state.selected).cloned(),
+                ) {
+                    state.request(
+                        &client,
+                        Request::Download {
+                            source,
+                            manga,
+                            chapter,
+                            directory: directory.to_path_buf(),
+                        },
+                    );
+                }
+            }
             KeyCode::Char('j') | KeyCode::Down => {
                 state.selected = (state.selected + 1).min(state.items().len().saturating_sub(1))
             }
@@ -301,7 +419,7 @@ mod tests {
     use crate::hn_client::{Event, Failure, Item};
 
     #[test]
-    fn metadata_routes_to_its_own_screen_without_starting_downloads() {
+    fn metadata_routes_to_its_own_screen_and_download_progress_stays_loading() {
         let mut browser = Browser::new();
         browser.accept(Event::Loaded(vec![Item {
             id: "source".into(),
@@ -321,11 +439,37 @@ mod tests {
         }]));
         assert_eq!(browser.chapters[0].title, "Chapter 1");
         assert_eq!(browser.sources.len(), 1);
+        browser.loading = true;
+        browser.accept(Event::DownloadProgress { done: 2, total: 3 });
+        assert!(browser.loading);
+        assert!(browser.notice.contains("2/3"));
         browser.accept(Event::Failed(Failure::Connector));
         assert!(browser.notice.contains("may require login"));
     }
     #[test]
-    fn back_navigation_never_chooses_a_download() {
+    fn source_filter_matches_title_or_connector_id() {
+        let mut browser = Browser::new();
+        browser.accept(Event::Loaded(vec![
+            Item {
+                id: "shueishamangaplus".into(),
+                title: "MANGA Plus by Shueisha".into(),
+            },
+            Item {
+                id: "other".into(),
+                title: "Another source".into(),
+            },
+        ]));
+        browser.source_filter = "shueisha".into();
+        browser.update_source_filter();
+        assert_eq!(browser.items().len(), 1);
+        assert_eq!(browser.items()[0].id, "shueishamangaplus");
+        browser.source_filter = "other".into();
+        browser.update_source_filter();
+        assert_eq!(browser.items()[0].id, "other");
+    }
+
+    #[test]
+    fn back_navigation_returns_to_titles() {
         let mut browser = Browser::new();
         browser.screen = Screen::Chapters;
         assert!(browser.back());
